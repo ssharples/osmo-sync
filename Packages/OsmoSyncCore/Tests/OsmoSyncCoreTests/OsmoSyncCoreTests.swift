@@ -91,6 +91,8 @@ final class ScreenStudioLogTests: XCTestCase {
         try FileManager.default.setAttributes([.creationDate: Date(timeIntervalSinceNow: -3600)],
                                               ofItemAtPath: root.appendingPathComponent("Old.screenstudio").path)
         try FileManager.default.setAttributes([.creationDate: Date(timeIntervalSinceNow: -3600)], ofItemAtPath: old.path)
+        try FileManager.default.setAttributes([.creationDate: Date(timeIntervalSinceNow: -3600)],
+                                              ofItemAtPath: old.appendingPathComponent("polyrecorder.log").path)
 
         let tailer = ScreenStudioLogTailer(folders: [root])
         XCTAssertEqual(tailer.poll(), [])
@@ -120,9 +122,10 @@ final class ScreenStudioLogTests: XCTestCase {
         try fm.createDirectory(at: projects, withIntermediateDirectories: true)
         let tailer = ScreenStudioLogTailer(folders: [inProgress, projects])
 
-        let live = inProgress.appendingPathComponent("Take 20:41:50.screenstudio")
-        try fm.createDirectory(at: live.appendingPathComponent("recording"), withIntermediateDirectories: true)
-        let log = live.appendingPathComponent("recording/polyrecorder.log")
+        // Live layout seen on Screen Studio 4.1: a plain folder with the log at its top level.
+        let live = inProgress.appendingPathComponent("PA278QV 2026-11-12 20:41:50")
+        try fm.createDirectory(at: live, withIntermediateDirectories: true)
+        let log = live.appendingPathComponent("polyrecorder.log")
         try "2026-11-12T20:41:50.000+0000 debug [Conductor] Starting recording.\n".write(to: log, atomically: true, encoding: .utf8)
         XCTAssertEqual(tailer.poll().map(\.event), [.starting])
 
@@ -132,9 +135,12 @@ final class ScreenStudioLogTests: XCTestCase {
         try h.close()
         XCTAssertEqual(tailer.poll().map(\.event), [.stopping])
 
-        // Screen Studio moves the finished project; the stopped line may land after the move.
-        let done = projects.appendingPathComponent(live.lastPathComponent)
-        try fm.moveItem(at: live, to: done)
+        // Screen Studio moves the finished project into a .screenstudio bundle, log under
+        // recording/; the stopped line may land after the move.
+        let done = projects.appendingPathComponent(live.lastPathComponent + ".screenstudio")
+        try fm.createDirectory(at: done.appendingPathComponent("recording"), withIntermediateDirectories: true)
+        try fm.moveItem(at: log, to: done.appendingPathComponent("recording/polyrecorder.log"))
+        try fm.removeItem(at: live)
         let h2 = try FileHandle(forWritingTo: done.appendingPathComponent("recording/polyrecorder.log"))
         h2.seekToEndOfFile()
         h2.write("2026-11-12T20:42:08.000+0000 notice [Conductor] Recording stopped. errorCount=0\n".data(using: .utf8)!)

@@ -78,13 +78,12 @@ public final class ScreenStudioLogTailer {
     }
 
     public func poll() -> [Hit] {
-        guard let (project, born) = newestProject() else { return [] }
-        let log = project.appendingPathComponent("recording/polyrecorder.log")
-        let name = project.lastPathComponent
+        guard let (project, log, born) = newestProject() else { return [] }
+        // The folder gains ".screenstudio" when it moves; the name before it stays the same.
+        let name = project.deletingPathExtension().lastPathComponent
         if name != currentName {
             // Ignore projects begun before the app started, so old recordings never fire events.
             guard born >= startedAt.addingTimeInterval(-5) else { return [] }
-            guard FileManager.default.fileExists(atPath: log.path) else { return [] }
             currentName = name
             offset = 0
             partial = ""
@@ -105,20 +104,23 @@ public final class ScreenStudioLogTailer {
         }
     }
 
-    /// The project whose recording began last, across all watched folders. Dated by its
-    /// `recording` folder, which is made when recording starts; the project folder itself is
-    /// made when Screen Studio moves it into place at the end.
-    private func newestProject() -> (URL, Date)? {
+    /// The project whose recording began last, across all watched folders, with its log.
+    ///
+    /// While recording, Screen Studio 4 keeps a plain folder (`<name>/polyrecorder.log`) in the
+    /// in-progress folder. After the stop it becomes `<name>.screenstudio/recording/polyrecorder.log`.
+    /// Projects are dated by the log, which is made when recording starts.
+    private func newestProject() -> (URL, URL, Date)? {
         let fm = FileManager.default
-        var best: (URL, Date)?
+        var best: (URL, URL, Date)?
         for folder in folders {
-            guard let items = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.creationDateKey],
+            guard let items = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil,
                                                           options: [.skipsHiddenFiles]) else { continue }
-            for p in items where p.pathExtension == "screenstudio" {
-                let rec = p.appendingPathComponent("recording")
-                let born = (try? rec.resourceValues(forKeys: [.creationDateKey]).creationDate)
-                    ?? (try? p.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                if best == nil || born > best!.1 { best = (p, born) }
+            for p in items {
+                let candidates = [p.appendingPathComponent("recording/polyrecorder.log"),
+                                  p.appendingPathComponent("polyrecorder.log")]
+                guard let log = candidates.first(where: { fm.fileExists(atPath: $0.path) }),
+                      let born = try? log.resourceValues(forKeys: [.creationDateKey]).creationDate else { continue }
+                if best == nil || born > best!.2 { best = (p, log, born) }
             }
         }
         return best
