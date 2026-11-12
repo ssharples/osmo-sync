@@ -396,6 +396,7 @@ final class OsmoCamera: NSObject, ObservableObject {
 
     private func dumlReady() {
         guard !state.isReady else { return }
+        busyRetries = 0
         approvalTimer?.invalidate(); approvalTimer = nil
         if let p = peripheral { pairedCameras.insert(p.identifier.uuidString) }
         state = .ready(name)
@@ -416,7 +417,7 @@ final class OsmoCamera: NSObject, ObservableObject {
             switch DUML.pairingReply(f.payload) {
             case .alreadyPaired: dumlReady()
             case .needsApproval: note("Waiting for you to approve on the camera")
-            case .deferred: fail("The camera is busy pairing. Try again in a few seconds.")
+            case .deferred: retryBusyPairing()
             case .other(let c): note("Pairing reply code \(c)")
             }
         case (0x07, 0x46) where !f.isResponse:
@@ -683,6 +684,28 @@ final class OsmoCamera: NSObject, ObservableObject {
         datalink?.close()
         datalink = nil
         wifiStatus = ""
+    }
+
+    private var busyRetries = 0
+
+    /// The camera answers "busy" for a few seconds after waking or after another app let go.
+    /// Drop the link and try again, up to five times, before giving up.
+    private func retryBusyPairing() {
+        busyRetries += 1
+        guard busyRetries <= 5, let id = peripheral?.identifier ?? savedCameraID else {
+            busyRetries = 0
+            fail("The camera is busy pairing. Try again in a few seconds.")
+            return
+        }
+        note("Camera busy pairing; retrying in 4s (\(busyRetries)/5)")
+        wantConnection = false
+        if let p = peripheral { central.cancelPeripheralConnection(p) }
+        reset()
+        state = .connecting("camera")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self, self.peripheral == nil else { return }
+            self.connect(to: id)
+        }
     }
 
     private func fail(_ why: String) {
