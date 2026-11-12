@@ -555,9 +555,11 @@ final class OsmoCamera: NSObject, ObservableObject {
         let r = await bleRequest(DUML.stationMode(false, seq: nextDUMLSeq()), timeout: 12)?.payload
         note("Hotspot switch reply: \(r.map { Self.hex($0) } ?? "none")")
         for _ in 0..<10 {
-            await pause(2)
+            await pause(1)
             let role = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 6)?.payload ?? []
-            if DUMLStation.role(role) == .accessPoint { note("Camera is on its own hotspot"); return true }
+            // A Pocket 4P reads back `00 08` on its hotspot rather than `00 00`; anything but
+            // "station" means it has left your Wi-Fi.
+            if !role.isEmpty, DUMLStation.role(role) != .station { note("Camera is on its own hotspot (\(Self.hex(role)))"); return true }
         }
         // The readback isn't always clear; the Mac's join decides.
         note("Camera hotspot role unconfirmed; trying to join anyway")
