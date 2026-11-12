@@ -136,6 +136,8 @@ final class OsmoCamera: NSObject, ObservableObject {
     /// The latest `0x02/0x80` status the camera pushed over Wi-Fi.
     private var wifiCamStatus: DUMLCameraStatus?
     private var wifiCamStatusAt = Date.distantPast
+    /// Raw `0x00/0x27` media-list pushes, gathered while listing.
+    private var mediaChunks: [[UInt8]] = []
 
     private var pairedCameras: Set<String> {
         get { Set(defaults.stringArray(forKey: "pairedCameras") ?? []) }
@@ -473,6 +475,44 @@ final class OsmoCamera: NSObject, ObservableObject {
         return ok
     }
 
+    /// Probe only: enter playback, check for the HTTP file server, list both stores, leave.
+    func probeMedia() async {
+        guard let link = datalink, link.isOpen else { note("PROBE media: no Wi-Fi link"); return }
+        let host = link.host
+        func list(_ counter: UInt8, _ cursor: UInt32, _ label: String) async {
+            mediaChunks = []
+            let r = await link.request(DUML.mediaList(counter: counter, cursor: cursor, seq: 0), timeout: 2)
+            note("PROBE media: list \(label) reply \(r.map { Self.hex($0.payload) } ?? "none")")
+            await pause(1.5)
+            link.send(DUML.mediaListTrigger(seq: 0))
+            await pause(2)
+            let data = mediaChunks.filter { $0.count > 10 && $0[1] == 0x01 }.flatMap { $0.dropFirst(10) }
+            note("PROBE media: \(label): \(mediaChunks.count) chunks, \(data.count) data bytes")
+            let text = String(decoding: data.map { (0x20...0x7E).contains($0) ? $0 : 0x0A }, as: UTF8.self)
+            for p in text.split(separator: "\n").filter({ $0.count > 8 && $0.contains("/") }).prefix(8) {
+                note("PROBE media path: \(p)")
+            }
+            for c in mediaChunks.prefix(4) { note("PROBE media chunk: " + Self.hex(Array(c.prefix(48)))) }
+        }
+        await list(1, 1, "SD before playback")
+        await list(2, 0x4000_0001, "internal before playback")
+        for attempt in 1...3 {
+            let r = await link.request(DUML.playback(true, seq: 0), timeout: 1)
+            note("PROBE media: enter playback #\(attempt) reply \(r.map { Self.hex($0.payload) } ?? "none")")
+            await pause(1.2)
+            if freshStatus()?.inPlayback == true { break }
+        }
+        note("PROBE media: in playback \(freshStatus()?.inPlayback.description ?? "?")")
+        await pause(1.7)
+        for port: UInt16 in [80, 21, 8080] {
+            note("PROBE media: port \(port) open \(await OsmoLANScan.probe(host, port: port))")
+        }
+        await list(1, 1, "SD in playback")
+        await list(2, 0x4000_0001, "internal in playback")
+        let r2 = await link.request(DUML.playback(false, seq: 0), timeout: 3)
+        note("PROBE media: leave playback reply \(r2.map { Self.hex($0.payload) } ?? "none")")
+    }
+
     private func freshStatus() -> DUMLCameraStatus? {
         Date().timeIntervalSince(wifiCamStatusAt) < 3 ? wifiCamStatus : nil
     }
@@ -619,7 +659,9 @@ final class OsmoCamera: NSObject, ObservableObject {
                 datalink = link
                 wifiCamStatus = nil
                 link.onPush = { [weak self] f in
-                    guard let self, let st = DUMLCameraStatus(f) else { return }
+                    guard let self else { return }
+                    if f.cmdSet == 0x00, f.cmdID == 0x27 { self.mediaChunks.append(f.payload); return }
+                    guard let st = DUMLCameraStatus(f) else { return }
                     if self.trace, st.isRecording != self.wifiCamStatus?.isRecording || st.inPlayback != self.wifiCamStatus?.inPlayback {
                         self.note("Camera status: recording \(st.isRecording), playback \(st.inPlayback)")
                     }

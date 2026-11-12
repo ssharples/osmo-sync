@@ -147,6 +147,8 @@ final class AppModel: ObservableObject {
                     camera.probeRecord(start: false, seq: seq &+ 0x0100, receiver: rx)
                     await wait(4)
                 }
+            } else if CommandLine.arguments.contains("--media") {
+                await camera.probeMedia()
             } else {
                 let started = await camera.startRecording()
                 camera.note("PROBE: start -> \(started)")

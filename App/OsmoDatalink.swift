@@ -73,7 +73,8 @@ final class OsmoDatalink {
         sendAck()
         send(DUML.appDeviceInfo(seq: 0)); sendAck()
         send(DUML.appPresence(seq: 0)); sendAck()
-        ackTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        // OpenPocketCine: echo the window at 40 Hz, or long transfers (the media list) stall.
+        ackTimer = Timer.scheduledTimer(withTimeInterval: 0.025, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.sendAck() }
         }
         presenceTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -194,7 +195,7 @@ final class OsmoDatalink {
         default:
             break
         }
-        for f in DUMLDatalink.frames(in: d) where !f.isResponse { onPush?(f) }
+        for f in DUMLDatalink.frames(in: d) where !f.isResponse || f.cmdID == 0x27 { onPush?(f) }
         for f in DUMLDatalink.frames(in: d) where f.isResponse {
             if trace, !(f.cmdSet == 0 && (f.cmdID == 0x88 || f.cmdID == 0x81)) {
                 log(String(format: "WiFi RX %02X/%02X: ", f.cmdSet, f.cmdID) + OsmoCamera.hex(f.payload))
@@ -246,8 +247,8 @@ enum OsmoLANScan {
         return Array(found.prefix(8))
     }
 
-    static func probe(_ host: String) async -> Bool {
-        let c = NWConnection(host: .init(host), port: .init(rawValue: DUMLDatalink.pokePort)!, using: .tcp)
+    static func probe(_ host: String, port: UInt16 = DUMLDatalink.pokePort) async -> Bool {
+        let c = NWConnection(host: .init(host), port: .init(rawValue: port)!, using: .tcp)
         defer { c.cancel() }
         return await withCheckedContinuation { k in
             let once = OnceFlag()

@@ -144,6 +144,29 @@ public enum DUML {
                      payload: packString(ssid) + packString(password))
     }
 
+    /// `0x02/0x0C` enter (`01 01 00 01`) or leave (`01 01 00 00`) playback.
+    public static func playback(_ enter: Bool, seq: UInt16) -> Frame {
+        Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0x0C,
+              payload: [1, 1, 0, enter ? 1 : 0])
+    }
+
+    /// `0x00/0x26` media list page for one store (SD: counter 1, cursor 1). Replies arrive
+    /// as `0x00/0x27` pushes. Payload template from OpenCine / Osmosis.
+    public static func mediaList(counter: UInt8, cursor: UInt32, seq: UInt16) -> Frame {
+        var p: [UInt8] = [0x4A, 0x00, 0x2A, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+                          0x2D, 0x00, 0x0D, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                          0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        p[4] = counter
+        for i in 0..<4 { p[10 + i] = UInt8((cursor >> (8 * UInt32(i))) & 0xFF) }
+        return Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x00, cmdID: 0x26, payload: p)
+    }
+
+    /// `0x00/0x26` stream trigger, sent between list queries.
+    public static func mediaListTrigger(seq: UInt16) -> Frame {
+        Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x00, cmdID: 0x26,
+              payload: [0x4A, 0x04, 0x0E, 0x10, 0x01, 0, 0, 0, 0, 0, 0x01, 0, 0, 0])
+    }
+
     // MARK: Wi-Fi link registration
 
     /// `0x00/0x81` app device info, sent once after the UDP handshake.
