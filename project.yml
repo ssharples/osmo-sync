@@ -1,0 +1,33 @@
+name: OsmoSync
+options:
+  bundleIdPrefix: com.ssharples
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  OsmoSyncCore:
+    path: Packages/OsmoSyncCore
+targets:
+  OsmoSync:
+    type: application
+    platform: macOS
+    sources: [App]
+    dependencies:
+      - package: OsmoSyncCore
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: OsmoSync
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        LSUIElement: true
+        LSApplicationCategoryType: public.app-category.video
+        NSBluetoothAlwaysUsageDescription: OsmoSync uses Bluetooth to start and stop recording on your DJI Osmo camera.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ssharples.OsmoSync
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: NO
+        MARKETING_VERSION: "0.1.0"
