@@ -81,6 +81,15 @@ final class OsmoCamera: NSObject, ObservableObject {
     private var keepaliveTimer: Timer?
     /// Pockets don't send a status feed over Bluetooth, so track recording from our own commands.
     @Published private(set) var dumlRecording = false
+    private var bleWaiters: [(set: UInt8, id: UInt8, c: CheckedContinuation<DUML.Frame?, Never>)] = []
+
+    // Wi-Fi link (Osmo Pocket on your home network)
+    /// Short status line for the menu, e.g. "Camera on Wi-Fi at 192.168.1.40".
+    @Published private(set) var wifiStatus = ""
+    @Published private(set) var wifiBusy = false
+    private(set) var datalink: OsmoDatalink?
+    /// Home Wi-Fi name and password, or nil when not set up. Supplied by AppModel.
+    var wifiCredentials: (() -> (ssid: String, password: String)?)?
 
     private let defaults = UserDefaults.standard
 
@@ -111,6 +120,19 @@ final class OsmoCamera: NSObject, ObservableObject {
         defaults.set(v, forKey: "dumlIdentifier")
         return v
     }()
+
+    /// The camera's hotspot-name reply, which proves a host on the LAN is this camera.
+    private var wifiIdentity: [UInt8]? {
+        get { defaults.data(forKey: "wifiIdentity").map { [UInt8]($0) } }
+        set { defaults.set(newValue.map { Data($0) }, forKey: "wifiIdentity") }
+    }
+
+    private var lastHost: String? {
+        get { defaults.string(forKey: "cameraHost") }
+        set { defaults.set(newValue, forKey: "cameraHost") }
+    }
+
+    var wifiLinkOpen: Bool { datalink?.isOpen == true }
 
     private var pairedCameras: Set<String> {
         get { Set(defaults.stringArray(forKey: "pairedCameras") ?? []) }
@@ -204,6 +226,8 @@ final class OsmoCamera: NSObject, ObservableObject {
         status = nil
         for (_, c) in recordWaiters { c.resume(returning: false) }
         recordWaiters = [:]
+        for w in bleWaiters { w.c.resume(returning: nil) }
+        bleWaiters = []
         peripheral = nil
     }
 
@@ -242,7 +266,7 @@ final class OsmoCamera: NSObject, ObservableObject {
         case (RSDK.setCamera, RSDK.idStatusPush):
             guard let s = RSDK.cameraStatus(f.payload) else { return }
             lastStatusAt = Date()
-            if trace, s != status { note("Status: \(s.modeName), recording \(s.isRecording), battery \(s.battery)%") }
+            if trace, s != status { note("Status: \(s.modeName), recording \(s.isRecording), battery \(s.battery.map(String.init) ?? "?")%") }
             let was = status?.isRecording
             status = s
             if was != s.isRecording { onRecordingChanged?(s.isRecording) }
@@ -369,9 +393,17 @@ final class OsmoCamera: NSObject, ObservableObject {
         if let p = peripheral { pairedCameras.insert(p.identifier.uuidString) }
         state = .ready(name)
         note("Connected to \(name)")
+        if !wifiLinkOpen, let creds = wifiCredentials?() {
+            Task { await joinWiFi(ssid: creds.ssid, password: creds.password) }
+        }
     }
 
     private func handleDUML(_ f: DUML.Frame) {
+        if f.isResponse, let i = bleWaiters.firstIndex(where: { $0.set == f.cmdSet && $0.id == f.cmdID }) {
+            if trace { note(String(format: "RX %02X/%02X: ", f.cmdSet, f.cmdID) + Self.hex(f.payload)) }
+            bleWaiters.remove(at: i).c.resume(returning: f)
+            return
+        }
         switch (f.cmdSet, f.cmdID) {
         case (0x07, 0x45) where f.isResponse:
             switch DUML.pairingReply(f.payload) {
@@ -402,25 +434,171 @@ final class OsmoCamera: NSObject, ObservableObject {
     }
 
     private func sendDUMLRecord(start: Bool) async -> Bool {
-        guard state.isReady else {
-            note("Can't \(start ? "start" : "stop") recording: camera not connected")
+        // Over Bluetooth the Pocket ignores record commands; they only work on its Wi-Fi link.
+        if !wifiLinkOpen || Date().timeIntervalSince(datalink?.lastHeard ?? .distantPast) > 5 {
+            datalink?.close(); datalink = nil
+            if wifiIdentity != nil { _ = await findOnNetwork(within: 8) }
+        }
+        guard let link = datalink, link.isOpen else {
+            note("Can't \(start ? "start" : "stop") recording: the camera isn't on Wi-Fi")
             return false
         }
-        let s = nextDUMLSeq()
-        sendDUML(DUML.record(start: start, seq: s))
-        note(start ? "Sent: start recording" : "Sent: stop recording")
-        let ok = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
-            recordWaiters[s] = c
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                self?.recordWaiters.removeValue(forKey: s)?.resume(returning: false)
-            }
-        }
+        note(start ? "Sent: start recording (Wi-Fi)" : "Sent: stop recording (Wi-Fi)")
+        let reply = await link.request(DUML.record(start: start, seq: 0), timeout: 5)
+        let code = reply?.payload.first
+        // 0xDF answers "start" while already recording.
+        let ok = code == 0 || (start && code == 0xDF)
+        if let code, !ok { note(String(format: "Camera refused record command (code %02X)", code)) }
         if ok {
             dumlRecording = start
             onRecordingChanged?(start)
         }
-        note(ok ? (start ? "Camera is recording" : "Camera stopped") : "Camera did not confirm")
+        note(ok ? (start ? "Camera is recording" : "Camera stopped") : reply == nil ? "Camera did not confirm" : "Camera refused")
         return ok
+    }
+
+    // MARK: Wi-Fi (camera joins your network)
+
+    private func bleRequest(_ f: DUML.Frame, timeout: Double) async -> DUML.Frame? {
+        guard peripheral != nil else { return nil }
+        return await withCheckedContinuation { c in
+            bleWaiters.append((f.cmdSet, f.cmdID, c))
+            sendDUML(f)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(timeout))
+                guard let self, let i = self.bleWaiters.firstIndex(where: { $0.set == f.cmdSet && $0.id == f.cmdID }) else { return }
+                self.bleWaiters.remove(at: i).c.resume(returning: nil)
+            }
+        }
+    }
+
+    private func pause(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
+
+    /// Moves the camera onto your Wi-Fi over Bluetooth, then opens the Wi-Fi command link.
+    /// Steps and reply shapes as captured on a Pocket 4 Pro by OpenCine.
+    @discardableResult
+    func joinWiFi(ssid: String, password: String) async -> Bool {
+        guard useDUML, state.isReady, !wifiBusy else { return wifiLinkOpen }
+        wifiBusy = true
+        defer { wifiBusy = false }
+        wifiStatus = "Reading camera identity"
+        guard let id = await bleRequest(DUML.getWiFiName(seq: nextDUMLSeq()), timeout: 12)?.payload,
+              id.count > 2, id[0] == 0 else {
+            wifiStatus = "Camera didn't answer the Wi-Fi query"
+            note(wifiStatus)
+            return false
+        }
+        wifiIdentity = id
+        sendDUML(DUML.videoMode(seq: nextDUMLSeq()))
+        await pause(2)
+        let roleReply = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 12)?.payload ?? []
+        let role = DUMLStation.role(roleReply)
+        note("Camera Wi-Fi role: \(role) (\(Self.hex(roleReply)))")
+        if role == .station {
+            wifiStatus = "Looking for the camera on \(ssid)"
+            if await findOnNetwork(within: 15) { return true }
+        } else {
+            guard role == .accessPoint else {
+                wifiStatus = "Camera didn't report its Wi-Fi mode"
+                note(wifiStatus)
+                return false
+            }
+            wifiStatus = "Switching camera to your Wi-Fi"
+            let sw = await bleRequest(DUML.stationMode(true, seq: nextDUMLSeq()), timeout: 12)?.payload
+            guard sw == [0, 0] else {
+                wifiStatus = "Camera refused to join a network (\(Self.hex(sw ?? [])))"
+                note(wifiStatus)
+                return false
+            }
+            var switched = false
+            for _ in 0..<6 {
+                let r = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 12)?.payload ?? []
+                if DUMLStation.role(r) == .station { switched = true; break }
+                await pause(2)
+            }
+            guard switched else {
+                wifiStatus = "Camera Wi-Fi is still starting. Try again."
+                note(wifiStatus)
+                return false
+            }
+        }
+        wifiStatus = "Waiting for camera Wi-Fi"
+        await pause(10)
+        for attempt in 1...3 {
+            wifiStatus = "Joining \(ssid) (try \(attempt) of 3)"
+            note(wifiStatus)
+            guard let join = DUML.joinWiFi(ssid: ssid, password: password, seq: nextDUMLSeq()) else {
+                wifiStatus = "Wi-Fi name or password is too long"
+                return false
+            }
+            guard let reply = await bleRequest(join, timeout: 45)?.payload else {
+                // A lost Bluetooth reply doesn't mean the join failed.
+                if await findOnNetwork(within: 0) { return true }
+                await pause(5)
+                continue
+            }
+            note("Join reply: \(Self.hex(Array(reply.prefix(4))))")
+            switch DUMLStation.joinResult(reply, attempt: attempt) {
+            case .joined:
+                wifiStatus = "Camera joined \(ssid); finding it"
+                if await findOnNetwork(within: 60) { return true }
+                wifiStatus = "Camera joined \(ssid) but the Mac can't find it. Is the Mac on \(ssid)?"
+                note(wifiStatus)
+                return false
+            case .retry:
+                await pause(5)
+            case .rejected:
+                wifiStatus = "Camera couldn't join \(ssid). Check the password; WPA3-only networks can refuse it."
+                note(wifiStatus)
+                return false
+            }
+        }
+        wifiStatus = "Camera Wi-Fi didn't respond. Keep it close and try again."
+        note(wifiStatus)
+        return false
+    }
+
+    /// Finds this camera on the Mac's network and opens the Wi-Fi link. Checks identity,
+    /// so another DJI camera on the same network is never used by mistake.
+    @discardableResult
+    func findOnNetwork(within patience: Double) async -> Bool {
+        guard let identity = wifiIdentity else { return false }
+        let deadline = Date().addingTimeInterval(patience)
+        repeat {
+            var hosts = lastHost.map { [$0] } ?? []
+            if let h = hosts.first, await !OsmoLANScan.probe(h) { hosts = [] }
+            if hosts.isEmpty { hosts = await OsmoLANScan.candidates() }
+            note("Wi-Fi scan: \(hosts.count) host\(hosts.count == 1 ? "" : "s") answering on 7001")
+            for host in hosts {
+                let link = OsmoDatalink(host: host, identifier: dumlIdentifier) { [weak self] in self?.note($0) }
+                link.trace = trace
+                do { try await link.open() } catch {
+                    note("\(host): \(error.localizedDescription)")
+                    continue
+                }
+                let reply = await link.request(DUML.getWiFiName(seq: 0), timeout: 8)
+                guard reply?.payload == identity else {
+                    note("\(host) is a different camera")
+                    link.close()
+                    continue
+                }
+                datalink?.close()
+                datalink = link
+                lastHost = host
+                wifiStatus = "Camera on Wi-Fi at \(host)"
+                note(wifiStatus)
+                return true
+            }
+            if Date() >= deadline { break }
+            await pause(2)
+        } while Date() < deadline
+        return false
+    }
+
+    func disconnectWiFi() {
+        datalink?.close()
+        datalink = nil
+        wifiStatus = ""
     }
 
     private func fail(_ why: String) {

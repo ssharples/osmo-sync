@@ -160,3 +160,78 @@ final class DUMLTests: XCTestCase {
         XCTAssertEqual(DUML.pairingReply([0x00, 0x06]), .deferred)
     }
 }
+
+/// Byte examples from OpenCine's `DumlTransportTests` and `MulticamTests`.
+final class DUMLDatalinkTests: XCTestCase {
+    func testTransportHeader() {
+        let h = DUMLDatalink.transportHeader(type: 0x05, payloadLength: 29, session: 0x3A7C, seq: 0xB890)
+        XCTAssertEqual(h, [0x25, 0x80, 0x7C, 0x3A, 0x90, 0xB8, 0x05, 0xCE])
+        XCTAssertEqual(h.reduce(0, ^), 0)
+    }
+
+    func testRoutingHeader() {
+        XCTAssertEqual(DUMLDatalink.routingHeader(seq: 0xB890, counter: 0x06),
+                       [0x88, 0xB8, 0x90, 0xB8, 0, 0, 0, 0, 0x06, 0x01, 0, 0])
+    }
+
+    func testHandshake() {
+        let p = DUMLDatalink.handshake(session: 0x1234, seq: 0, baseSeq: 0xB887)
+        XCTAssertEqual(p.count, 48)
+        XCTAssertEqual(Array(p[0..<8]), [0x30, 0x80, 0x34, 0x12, 0x00, 0x00, 0x00, 0x96])
+        XCTAssertEqual(Array(p[8..<14]), [0x87, 0xB8, 0x64, 0x00, 0x64, 0x00])
+    }
+
+    func testAckPayload() {
+        let p = DUMLDatalink.ackPayload(video: 0x1234, ackedData: 0x5678, extra: 0x5678)
+        XCTAssertEqual(p.count, 26)
+        XCTAssertEqual(Array(p[0..<8]), [0x34, 0x12, 0x34, 0x12, 0, 0, 0, 0])
+        XCTAssertEqual(Array(p[8..<16]), [0x78, 0x56, 0x78, 0x56, 0, 0, 0, 0])
+        XCTAssertEqual(DUMLDatalink.ack(session: 1, video: 0, ackedData: 0, extra: 0).count, 34)
+    }
+
+    func testCommandRoundTripAndScan() {
+        let rec = DUML.record(start: true, seq: 0xA000)
+        let pkt = DUMLDatalink.command(rec, session: 0x3A7C, seq: 0xB890, counter: 1)
+        XCTAssertEqual(pkt.count, 8 + 12 + 14)
+        XCTAssertEqual(DUMLDatalink.packetType(pkt), 0x05)
+        XCTAssertEqual(DUMLDatalink.frames(in: pkt), [rec])
+        XCTAssertEqual(DUMLDatalink.frames(in: pkt + pkt), [rec, rec])
+    }
+
+    func testInitialWindow() {
+        var tel = DUMLDatalink.transportHeader(type: 0x01, payloadLength: 26, session: 1, seq: 0)
+        tel += [UInt8](repeating: 0, count: 26)
+        tel[8] = 0x10; tel[9] = 0x20
+        tel[18] = 0x38; tel[19] = 0xCD
+        XCTAssertEqual(DUMLDatalink.commandSeq(fromInitialWindow: tel), 0x2018)
+        XCTAssertEqual(DUMLDatalink.telemetryWindows(tel)?.ackedData, 0xCD38)
+        XCTAssertNil(DUMLDatalink.commandSeq(fromInitialWindow: Array(tel[0..<8])))
+        XCTAssertTrue(DUMLDatalink.isForward(0x0008, from: 0xFFF8))
+        XCTAssertFalse(DUMLDatalink.isForward(0xFFF8, from: 0x0008))
+    }
+
+    func testStationCommands() {
+        let s = DUML.stationMode(true, seq: 42)
+        XCTAssertEqual([s.receiver, s.cmdSet, s.cmdID, s.flags], [7, 7, 0x48, 0x40])
+        XCTAssertEqual(s.payload, [1])
+        XCTAssertEqual(DUML.wifiRole(seq: 1).payload, [0])
+        XCTAssertEqual(DUML.wifiRole(seq: 1).cmdID, 0x39)
+        let v = DUML.videoMode(seq: 1)
+        XCTAssertEqual([v.receiver, v.cmdSet, v.cmdID], [8, 2, 0xE1])
+        let j = DUML.joinWiFi(ssid: "Café", password: "", seq: 1)!
+        XCTAssertEqual(j.payload, [5] + Array("Café".utf8) + [0])
+        XCTAssertNil(DUML.joinWiFi(ssid: String(repeating: "a", count: 33), password: "", seq: 1))
+        XCTAssertEqual(DUML.appDeviceInfo(seq: 0).receiver, 0x48)
+        XCTAssertEqual(DUML.appPresence(seq: 0).receiver, 0x28)
+    }
+
+    func testStationPolicy() {
+        XCTAssertEqual(DUMLStation.role([0, 1]), .station)
+        XCTAssertEqual(DUMLStation.role([0, 0]), .accessPoint)
+        XCTAssertEqual(DUMLStation.joinResult([0, 0], attempt: 1), .joined)
+        XCTAssertEqual(DUMLStation.joinResult([1, 0xFF], attempt: 1), .retry)
+        XCTAssertEqual(DUMLStation.joinResult([1, 0xFF], attempt: 3), .rejected)
+        XCTAssertEqual(DUMLStation.hosts(address: "192.168.1.20", mask: "255.255.255.0")?.count, 253)
+        XCTAssertNil(DUMLStation.hosts(address: "10.0.0.2", mask: "255.0.0.0"))
+    }
+}

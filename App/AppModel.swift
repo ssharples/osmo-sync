@@ -1,7 +1,30 @@
 import AppKit
 import Foundation
 import OsmoSyncCore
+import Security
 import UserNotifications
+
+/// The home Wi-Fi password, kept in the login keychain rather than in preferences.
+enum WiFiKeychain {
+    private static let service = "com.ssharples.OsmoSync.wifi"
+
+    static func password(for ssid: String) -> String? {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: ssid, kSecReturnData as String: true]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+
+    static func save(_ password: String, for ssid: String) {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                kSecAttrAccount as String: ssid]
+        SecItemDelete(q as CFDictionary)
+        var add = q
+        add[kSecValueData as String] = Data(password.utf8)
+        SecItemAdd(add as CFDictionary, nil)
+    }
+}
 
 /// One Screen Studio recording and the camera clips that go with it.
 struct Take: Codable, Identifiable, Equatable {
@@ -28,6 +51,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var takes: [Take] = []
     @Published private(set) var screenStudioRecording = false
     @Published private(set) var importing = false
+    /// Home Wi-Fi the camera joins so the Mac can start and stop it. Password lives in the keychain.
+    @Published var wifiSSID: String { didSet { defaults.set(wifiSSID, forKey: "wifiSSID") } }
 
     private let defaults = UserDefaults.standard
     private var tailer: ScreenStudioLogTailer?
@@ -37,6 +62,7 @@ final class AppModel: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser
         autoRecord = defaults.object(forKey: "autoRecord") as? Bool ?? true
         autoImport = defaults.object(forKey: "autoImport") as? Bool ?? true
+        wifiSSID = defaults.string(forKey: "wifiSSID") ?? ""
         projectsFolder = URL(fileURLWithPath: defaults.string(forKey: "projectsFolder")
                              ?? home.appendingPathComponent("Screen Studio Projects").path)
         destination = URL(fileURLWithPath: defaults.string(forKey: "destination")
@@ -46,6 +72,10 @@ final class AppModel: ObservableObject {
             takes = saved.map { var t = $0; if t.end == nil { t.end = t.start.addingTimeInterval(1) }; return t }
         }
         restartWatcher()
+        camera.wifiCredentials = { [weak self] in
+            guard let self, !self.wifiSSID.isEmpty, let pw = WiFiKeychain.password(for: self.wifiSSID) else { return nil }
+            return (self.wifiSSID, pw)
+        }
 
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didMountNotification, object: nil, queue: .main
@@ -55,6 +85,18 @@ final class AppModel: ObservableObject {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         if CommandLine.arguments.contains("--probe") { runProbe() }
+    }
+
+    var hasWiFiPassword: Bool { !wifiSSID.isEmpty && WiFiKeychain.password(for: wifiSSID) != nil }
+
+    /// Saves the Wi-Fi details and moves the camera onto that network.
+    func setUpWiFi(ssid: String, password: String) {
+        let name = ssid.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        wifiSSID = name
+        if !password.isEmpty { WiFiKeychain.save(password, for: name) }
+        guard let pw = WiFiKeychain.password(for: name) else { return }
+        Task { await camera.joinWiFi(ssid: name, password: pw) }
     }
 
     // MARK: Probe
@@ -91,6 +133,8 @@ final class AppModel: ObservableObject {
             }
             guard camera.state.isReady else { camera.note("PROBE: not connected after 60s"); return }
             await wait(3)
+            for _ in 0..<400 where camera.wifiBusy { await wait(0.5) }
+            camera.note("PROBE: Wi-Fi link \(camera.wifiLinkOpen ? "open" : "not open") \(camera.wifiStatus)")
             camera.note("PROBE: status \(camera.status.map { "\($0.modeName), recording \($0.isRecording)" } ?? "none yet")")
             if CommandLine.arguments.contains("--variants") {
                 // seq big-endian on the wire; a small seq; the camera as receiver id 1 type 1.

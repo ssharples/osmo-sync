@@ -4,12 +4,17 @@ struct MenuView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var camera: OsmoCamera
     @State private var showLog = false
+    @State private var ssid = ""
+    @State private var password = ""
+    @State private var editingWiFi = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
             cameraSection
+            Divider()
+            wifiSection
             Divider()
             toggles
             Divider()
@@ -75,6 +80,50 @@ struct MenuView: View {
                     }
                     .buttonStyle(.plain)
                     .font(.callout)
+                }
+            }
+        }
+    }
+
+    /// Osmo Pockets only take record commands over Wi-Fi, so the camera joins your network.
+    private var wifiSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("Wi-Fi", systemImage: camera.wifiLinkOpen ? "wifi" : "wifi.slash")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(camera.wifiLinkOpen ? .green : .primary)
+                Spacer()
+                if camera.wifiBusy { ProgressView().controlSize(.small) }
+            }
+            if !camera.wifiStatus.isEmpty {
+                Text(camera.wifiStatus).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+            }
+            if editingWiFi || model.wifiSSID.isEmpty {
+                Text("The camera joins this network so the Mac can start and stop it. Use the network this Mac is on.")
+                    .font(.caption).foregroundStyle(.secondary)
+                TextField("Wi-Fi name", text: $ssid).textFieldStyle(.roundedBorder)
+                SecureField("Password", text: $password).textFieldStyle(.roundedBorder)
+                HStack {
+                    Button("Connect camera to Wi-Fi") {
+                        model.setUpWiFi(ssid: ssid, password: password)
+                        password = ""
+                        editingWiFi = false
+                    }
+                    .disabled(ssid.trimmingCharacters(in: .whitespaces).isEmpty || !camera.state.isReady || camera.wifiBusy)
+                    if editingWiFi { Button("Cancel") { editingWiFi = false } }
+                }
+                if !camera.state.isReady {
+                    Text("Connect the camera over Bluetooth first.").font(.caption2).foregroundStyle(.secondary)
+                }
+            } else {
+                HStack {
+                    Text(model.wifiSSID).font(.callout)
+                    Spacer()
+                    if !camera.wifiLinkOpen {
+                        Button("Retry") { model.setUpWiFi(ssid: model.wifiSSID, password: "") }
+                            .disabled(!camera.state.isReady || camera.wifiBusy || !model.hasWiFiPassword)
+                    }
+                    Button("Change") { ssid = model.wifiSSID; editingWiFi = true }
                 }
             }
         }

@@ -114,6 +114,54 @@ public enum DUML {
         Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0x02, payload: [start ? 1 : 0])
     }
 
+    /// Receiver byte from a module type and index.
+    public static func rx(type: UInt8, index: UInt8) -> UInt8 { index << 5 | type }
+
+    /// `0x07/0x07` reads the camera's own hotspot name. The reply doubles as its identity on the network.
+    public static func getWiFiName(seq: UInt16 = 0x8007) -> Frame {
+        Frame(receiver: rxWifi, seq: seq, flags: flagRequest, cmdSet: 0x07, cmdID: 0x07, payload: [])
+    }
+
+    /// `0x07/0x39` asks which Wi-Fi role the camera is in. See `DUMLStation.role`.
+    public static func wifiRole(seq: UInt16) -> Frame {
+        Frame(receiver: rxWifi, seq: seq, flags: flagRequest, cmdSet: 0x07, cmdID: 0x39, payload: [0])
+    }
+
+    /// `0x07/0x48` switches between joining your Wi-Fi (`true`) and running its own hotspot.
+    public static func stationMode(_ on: Bool, seq: UInt16) -> Frame {
+        Frame(receiver: rxWifi, seq: seq, flags: flagRequest, cmdSet: 0x07, cmdID: 0x48, payload: [on ? 1 : 0])
+    }
+
+    /// `0x02/0xE1` to receiver 8: video shooting mode. Sent before joining Wi-Fi.
+    public static func videoMode(seq: UInt16) -> Frame {
+        Frame(receiver: 0x08, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0xE1, payload: [1])
+    }
+
+    /// `0x07/0x47` joins a Wi-Fi network. Nil if the name or password is too long.
+    public static func joinWiFi(ssid: String, password: String, seq: UInt16) -> Frame? {
+        guard !ssid.isEmpty, ssid.utf8.count <= 32, password.utf8.count <= 63 else { return nil }
+        return Frame(receiver: rxWifi, seq: seq, flags: flagRequest, cmdSet: 0x07, cmdID: 0x47,
+                     payload: packString(ssid) + packString(password))
+    }
+
+    // MARK: Wi-Fi link registration
+
+    /// `0x00/0x81` app device info, sent once after the UDP handshake.
+    public static func appDeviceInfo(seq: UInt16) -> Frame {
+        var b = [UInt8](repeating: 0, count: 62)
+        b[1] = 0x41; b[2] = 0x50; b[3] = 0x50  // "APP"
+        b[41] = 0x02
+        b[50] = 0x02
+        b[51] = 0x08
+        return Frame(receiver: rx(type: 0x08, index: 2), seq: seq, flags: 0x80, cmdSet: 0x00, cmdID: 0x81, payload: b)
+    }
+
+    /// `0x00/0x88` app presence, about once a second to hold the session open.
+    public static func appPresence(seq: UInt16) -> Frame {
+        Frame(receiver: rx(type: 0x08, index: 1), seq: seq, flags: flagRequest, cmdSet: 0x00, cmdID: 0x88,
+              payload: [0x17, 0x00, 0x46, 0x23, 0x7C, 0x41, 0x50, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02])
+    }
+
     public enum PairingReply: Equatable { case alreadyPaired, needsApproval, deferred, other(UInt8) }
 
     public static func pairingReply(_ payload: [UInt8]) -> PairingReply {

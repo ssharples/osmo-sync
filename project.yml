@@ -23,6 +23,7 @@ targets:
         LSUIElement: true
         LSApplicationCategoryType: public.app-category.video
         NSBluetoothAlwaysUsageDescription: OsmoSync uses Bluetooth to start and stop recording on your DJI Osmo camera.
+        NSLocalNetworkUsageDescription: OsmoSync finds your DJI Osmo on your Wi-Fi to start and stop recording.
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ssharples.OsmoSync
