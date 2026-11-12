@@ -1,0 +1,172 @@
+import Foundation
+import OsmoSyncCore
+
+/// Moves the Mac's Wi-Fi between your network and the camera's hotspot.
+///
+/// Uses `networksetup`: on macOS 26 CoreWLAN hides network names from apps without
+/// Location access, so it can't find the camera's hotspot to join. Passwords go only
+/// to `networksetup` and are never logged.
+enum MacWiFi {
+    /// The Wi-Fi device, usually `en0`.
+    static let device: String = {
+        let out = run(["-listallhardwareports"]).output
+        let lines = out.components(separatedBy: "\n")
+        for (i, l) in lines.enumerated() where l.hasSuffix(": Wi-Fi") && i + 1 < lines.count {
+            if let d = lines[i + 1].components(separatedBy: "Device: ").last, !d.isEmpty { return d }
+        }
+        return "en0"
+    }()
+
+    @discardableResult
+    static func run(_ args: [String]) -> (status: Int32, output: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/networksetup")
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return (-1, error.localizedDescription) }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    /// Asks macOS to join a network. Returns networksetup's complaint, or nil if it said nothing.
+    static func join(_ ssid: String, password: String) async -> String? {
+        await Task.detached {
+            let r = run(["-setairportnetwork", device, ssid, password])
+            let text = r.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return r.status == 0 && text.isEmpty ? nil : (text.isEmpty ? "exit \(r.status)" : text)
+        }.value
+    }
+
+    /// Stops macOS joining the camera's hotspot by itself later. Best effort; may need admin.
+    static func forget(_ ssid: String) async {
+        _ = await Task.detached { run(["-removepreferredwirelessnetwork", device, ssid]) }.value
+    }
+
+    /// IPv4 addresses on each up, non-loopback interface.
+    static func addresses() -> [String: String] {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return [:] }
+        defer { freeifaddrs(list) }
+        var out: [String: String] = [:]
+        for p in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = p.pointee
+            guard let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET),
+                  ifa.ifa_flags & UInt32(IFF_UP) != 0, ifa.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
+            var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(addr, socklen_t(addr.pointee.sa_len), &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST)
+            out[String(cString: ifa.ifa_name)] = String(cString: buf)
+        }
+        return out
+    }
+
+    static var wifiAddress: String? { addresses()[device] }
+
+    /// True when a wired port (such as a USB Ethernet adapter) has an address, so the Mac
+    /// stays online while its Wi-Fi is on the camera.
+    static var wiredOnline: Bool {
+        addresses().contains { name, ip in
+            name.hasPrefix("en") && name != device && !ip.hasPrefix("169.254.")
+        }
+    }
+
+    static func waitForWiFi(_ ok: (String) -> Bool, within s: Double) async -> Bool {
+        let deadline = Date().addingTimeInterval(s)
+        while Date() < deadline {
+            if let ip = wifiAddress, ok(ip) { return true }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        return false
+    }
+
+    /// True once Apple's captive-portal check page loads.
+    static func internetUp(within s: Double) async -> Bool {
+        let deadline = Date().addingTimeInterval(s)
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 4
+        let session = URLSession(configuration: cfg)
+        while Date() < deadline {
+            if let (_, r) = try? await session.data(from: URL(string: "http://captive.apple.com/hotspot-detect.html")!),
+               (r as? HTTPURLResponse)?.statusCode == 200 { return true }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        return false
+    }
+}
+
+/// Resumable download from the camera's `/v2` file server, in 64 MB ranges written to
+/// `<dest>.part` and renamed once the size matches. Same approach as OsmoOffload.
+enum CameraDownload {
+    enum Failure: LocalizedError {
+        case notFound, sizeMismatch(Int64, Int64), gaveUp(String)
+        var errorDescription: String? {
+            switch self {
+            case .notFound: "The camera didn't serve that clip"
+            case .sizeMismatch(let got, let want): "Got \(got) of \(want) bytes"
+            case .gaveUp(let why): "Download kept failing: \(why)"
+            }
+        }
+    }
+
+    static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 20
+        c.waitsForConnectivity = false
+        return URLSession(configuration: c)
+    }()
+
+    /// Finds which storage serves `path` and how big it is.
+    static func locate(_ path: String, prefer: Int) async -> (storage: Int, size: Int64)? {
+        for storage in [prefer, 1 - prefer] {
+            var req = URLRequest(url: OsmoClips.url(path: path, storage: storage))
+            req.httpMethod = "HEAD"
+            if let (_, r) = try? await session.data(for: req), let h = r as? HTTPURLResponse,
+               h.statusCode == 200, h.expectedContentLength > 0 {
+                return (storage, h.expectedContentLength)
+            }
+        }
+        return nil
+    }
+
+    static func fetch(_ path: String, storage: Int, size: Int64, to dest: URL,
+                      progress: @escaping (Int64) -> Void) async throws {
+        let fm = FileManager.default
+        let part = dest.appendingPathExtension("part")
+        if !fm.fileExists(atPath: part.path) { fm.createFile(atPath: part.path, contents: nil) }
+        var pos = ((try? fm.attributesOfItem(atPath: part.path)[.size]) as? NSNumber)?.int64Value ?? 0
+        if pos > size { try fm.removeItem(at: part); fm.createFile(atPath: part.path, contents: nil); pos = 0 }
+        let chunk: Int64 = 64 << 20
+        var failures = 0
+        while pos < size {
+            var req = URLRequest(url: OsmoClips.url(path: path, storage: storage))
+            req.setValue("bytes=\(pos)-\(min(pos + chunk, size) - 1)", forHTTPHeaderField: "Range")
+            do {
+                let (tmp, r) = try await session.download(for: req)
+                defer { try? fm.removeItem(at: tmp) }
+                guard let h = r as? HTTPURLResponse, h.statusCode == 206 || (h.statusCode == 200 && pos == 0) else {
+                    throw Failure.gaveUp("HTTP \((r as? HTTPURLResponse)?.statusCode ?? 0)")
+                }
+                let data = try Data(contentsOf: tmp, options: .alwaysMapped)
+                // A 200 means the camera sent the whole file; keep only what we asked for.
+                let piece = h.statusCode == 200 ? data.prefix(Int(min(chunk, size))) : data
+                guard !piece.isEmpty else { throw Failure.gaveUp("empty reply at \(pos)") }
+                let out = try FileHandle(forWritingTo: part)
+                try out.seekToEnd()
+                try out.write(contentsOf: piece)
+                try out.close()
+                pos += Int64(piece.count)
+                failures = 0
+                progress(pos)
+            } catch {
+                failures += 1
+                if failures > 6 { throw Failure.gaveUp(error.localizedDescription) }
+                try? await Task.sleep(for: .seconds(min(2.0 * Double(failures), 8)))
+            }
+        }
+        let got = ((try? fm.attributesOfItem(atPath: part.path)[.size]) as? NSNumber)?.int64Value ?? 0
+        guard got == size else { throw Failure.sizeMismatch(got, size) }
+        try fm.moveItem(at: part, to: dest)
+    }
+}

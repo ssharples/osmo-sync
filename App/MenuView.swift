@@ -154,10 +154,17 @@ struct MenuView: View {
                 Button(model.importing ? "Copying…" : "Import now") { model.importPending() }
                     .disabled(model.importing)
             }
-            if model.takes.contains(where: \.needsImport), !model.cameraCardMounted, !model.importing {
-                Label("To copy the clip, unplug the Pocket's USB-C, plug it back in and tap File Transfer on its screen. OsmoSync copies it as soon as the drive appears.",
-                      systemImage: "cable.connector")
-                    .font(.caption).foregroundStyle(.orange)
+            if !model.hotspotStatus.isEmpty {
+                Label(model.hotspotStatus, systemImage: "wifi")
+                    .font(.caption).foregroundStyle(.blue)
+            } else if model.takes.contains(where: \.needsImport), !model.cameraCardMounted, !model.importing {
+                HStack {
+                    Label("Clip still on the camera", systemImage: "exclamationmark.circle")
+                        .font(.caption).foregroundStyle(.orange)
+                    Spacer()
+                    Button("Copy over Wi-Fi") { model.copyLatestOverHotspot() }
+                        .font(.caption)
+                }
             }
             if model.takes.isEmpty {
                 Text("Start a recording in Screen Studio and the Osmo starts with it.")

@@ -122,6 +122,11 @@ public enum DUML {
         Frame(receiver: rxWifi, seq: seq, flags: flagRequest, cmdSet: 0x07, cmdID: 0x07, payload: [])
     }
 
+    /// `0x07/0x0E` reads the camera's own hotspot password. Reply: `[status][len][bytes]`.
+    public static func getWiFiPassword(seq: UInt16) -> Frame {
+        Frame(receiver: rxWifi, seq: seq, flags: flagRequest, cmdSet: 0x07, cmdID: 0x0E, payload: [])
+    }
+
     /// `0x07/0x39` asks which Wi-Fi role the camera is in. See `DUMLStation.role`.
     public static func wifiRole(seq: UInt16) -> Frame {
         Frame(receiver: rxWifi, seq: seq, flags: flagRequest, cmdSet: 0x07, cmdID: 0x39, payload: [0])

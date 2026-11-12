@@ -51,6 +51,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var takes: [Take] = []
     @Published private(set) var screenStudioRecording = false
     @Published private(set) var importing = false
+    /// What the Wi-Fi hotspot copy is doing, shown in the menu. Empty when idle.
+    @Published private(set) var hotspotStatus = ""
     /// Home Wi-Fi the camera joins so the Mac can start and stop it. Password lives in the keychain.
     @Published var wifiSSID: String { didSet { defaults.set(wifiSSID, forKey: "wifiSSID") } }
 
@@ -86,6 +88,16 @@ final class AppModel: ObservableObject {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         if CommandLine.arguments.contains("--probe") { runProbe() }
+        if CommandLine.arguments.contains("--copy-latest") {
+            // Test hook: wait for the camera and its Wi-Fi link, then copy the newest waiting take.
+            Task { @MainActor in
+                for _ in 0..<180 where !(camera.state.isReady && camera.wifiLinkOpen) { try? await Task.sleep(for: .seconds(0.5)) }
+                camera.note("COPY TEST: camera ready \(camera.state.isReady), Wi-Fi link \(camera.wifiLinkOpen)")
+                guard let take = takes.first(where: \.needsImport) else { camera.note("COPY TEST: nothing waiting"); return }
+                await copyOverHotspot(take)
+                camera.note("COPY TEST: done")
+            }
+        }
     }
 
     var hasWiFiPassword: Bool { !wifiSSID.isEmpty && WiFiKeychain.password(for: wifiSSID) != nil }
@@ -234,9 +246,117 @@ final class AppModel: ObservableObject {
             if cameraCardMounted {
                 importPending()
             } else {
-                notify("Copy the Osmo clip", "Unplug the Pocket's USB-C, plug it back in and tap File Transfer. OsmoSync copies it when the drive appears.")
+                await copyOverHotspot(take)
             }
         }
+    }
+
+    // MARK: Copy over the camera's hotspot
+
+    /// Copies the newest take waiting for import, over the camera's hotspot.
+    func copyLatestOverHotspot() {
+        guard let take = takes.first(where: \.needsImport) else { camera.note("Nothing waiting to copy"); return }
+        Task { await copyOverHotspot(take) }
+    }
+
+    /// The camera serves files only on its own hotspot. So: list the take's clips over your
+    /// Wi-Fi, switch the camera to its hotspot, move the Mac's Wi-Fi onto it, download, then
+    /// put both back on your network. A wired connection keeps the Mac online meanwhile.
+    func copyOverHotspot(_ take: Take) async {
+        guard hotspotStatus.isEmpty, !importing else { return }
+        func status(_ s: String) { hotspotStatus = s; camera.note(s) }
+        func usbFallback(_ why: String) {
+            hotspotStatus = ""
+            camera.note("Wi-Fi copy didn't run: \(why)")
+            notify("Copy the Osmo clip", "\(why) Unplug the Pocket's USB-C, plug it back in and tap File Transfer instead.")
+        }
+        guard camera.state.isReady else { return usbFallback("The camera isn't connected over Bluetooth.") }
+        guard let home = camera.wifiCredentials?() else { return usbFallback("OsmoSync doesn't have your Wi-Fi password.") }
+        guard !camera.isRecording else { return usbFallback("The camera is still recording.") }
+
+        status("Finding the clip on the camera")
+        if !camera.wifiLinkOpen { await camera.findOnNetwork(within: 15) }
+        let listed = await camera.listClips()
+        let wanted = OsmoClips.pick(listed.map(\.path), takeStart: take.start, takeEnd: take.end ?? take.start)
+        let clips = wanted.compactMap { w in listed.first { $0.path == w } }
+        guard !clips.isEmpty else { return usbFallback("No clip on the camera matches this take.") }
+        guard let login = await camera.hotspotLogin() else { return usbFallback("The camera didn't share its hotspot login.") }
+
+        let wired = MacWiFi.wiredOnline
+        let busy = wired ? "Copying clip…" : "Copying clip… internet paused"
+        status(busy)
+        var copied: [String] = []
+        var problem: String?
+        if await camera.switchToHotspot() {
+            var joined = false
+            for attempt in 1...4 where !joined {
+                if let msg = await MacWiFi.join(login.ssid, password: login.password) {
+                    camera.note("Mac join try \(attempt): \(msg)")
+                }
+                joined = await MacWiFi.waitForWiFi({ $0.hasPrefix("192.168.2.") }, within: 12)
+            }
+            if joined {
+                camera.note("Mac on the camera hotspot")
+                let fm = FileManager.default
+                try? fm.createDirectory(at: destination, withIntermediateDirectories: true)
+                for (i, clip) in clips.enumerated() {
+                    guard let (storage, size) = await CameraDownload.locate(clip.path, prefer: clip.storage) else {
+                        problem = "The camera didn't serve \((clip.path as NSString).lastPathComponent)"
+                        break
+                    }
+                    let suffix = clips.count > 1 ? " part \(i + 1)" : ""
+                    var target = destination.appendingPathComponent("\(take.name) - Osmo\(suffix).MP4")
+                    var n = 2
+                    while fm.fileExists(atPath: target.path) {
+                        target = destination.appendingPathComponent("\(take.name) - Osmo\(suffix) (\(n)).MP4"); n += 1
+                    }
+                    let mb = Double(size) / 1_048_576
+                    let started = Date()
+                    do {
+                        try await CameraDownload.fetch(clip.path, storage: storage, size: size, to: target) { done in
+                            Task { @MainActor in
+                                self.hotspotStatus = "\(busy) \(Int(Double(done) * 100 / Double(size)))% of \(Int(mb)) MB"
+                            }
+                        }
+                        let secs = max(Date().timeIntervalSince(started), 0.1)
+                        camera.note(String(format: "Copied %@ (%.0f MB in %.0fs, %.0f MB/s)", target.lastPathComponent, mb, secs, mb / secs))
+                        copied.append(target.path)
+                    } catch {
+                        problem = error.localizedDescription
+                        break
+                    }
+                }
+            } else {
+                problem = "The Mac couldn't join the camera's hotspot"
+            }
+        } else {
+            problem = "The camera didn't switch to its hotspot"
+        }
+
+        // Put everything back, whatever happened above.
+        status("Rejoining \(home.ssid)")
+        if let msg = await MacWiFi.join(home.ssid, password: home.password) { camera.note("Mac rejoin: \(msg)") }
+        let back = await MacWiFi.waitForWiFi({ !$0.hasPrefix("192.168.2.") && !$0.hasPrefix("169.254.") }, within: 30)
+        await MacWiFi.forget(login.ssid)
+        let online = await MacWiFi.internetUp(within: 30)
+        camera.note("Mac back on \(home.ssid): \(back), internet: \(online)")
+        status("Putting the camera back on \(home.ssid)")
+        let camBack = await camera.joinWiFi(ssid: home.ssid, password: home.password)
+        camera.note("Camera back on Wi-Fi: \(camBack)")
+        hotspotStatus = ""
+
+        var t = take
+        if !copied.isEmpty {
+            t.imported = copied
+            t.importNote = "Copied \(copied.count) clip\(copied.count == 1 ? "" : "s") over Wi-Fi"
+            notify("Osmo clip copied", "\(take.name) → \(destination.lastPathComponent)")
+        } else {
+            t.importNote = problem ?? "Wi-Fi copy failed"
+            notify("Copy the Osmo clip", "\(t.importNote ?? "") Unplug the Pocket's USB-C, plug it back in and tap File Transfer instead.")
+        }
+        camera.note("\(take.name): \(t.importNote ?? "")")
+        updateTake(t)
+        if !online { notify("Check your internet", "OsmoSync put the Mac back on \(home.ssid) but couldn't reach the internet.") }
     }
 
     /// Manual start/stop for testing without Screen Studio.

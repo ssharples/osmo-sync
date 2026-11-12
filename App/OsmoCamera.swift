@@ -514,6 +514,56 @@ final class OsmoCamera: NSObject, ObservableObject {
         note("PROBE media: leave playback reply \(r2.map { Self.hex($0.payload) } ?? "none")")
     }
 
+    // MARK: Hotspot copy
+
+    /// Lists clips over the Wi-Fi link: internal storage, then the microSD card if any.
+    /// Returns paths without extension, newest first, each with the `/v2` storage id to try first.
+    func listClips() async -> [(path: String, storage: Int)] {
+        guard let link = datalink, link.isOpen else { return [] }
+        var out: [(String, Int)] = []
+        for (counter, cursor, storage) in [(UInt8(2), UInt32(0x4000_0001), 1), (UInt8(1), UInt32(1), 0)] {
+            mediaChunks = []
+            _ = await link.request(DUML.mediaList(counter: counter, cursor: cursor, seq: 0), timeout: 2)
+            await pause(1)
+            link.send(DUML.mediaListTrigger(seq: 0))
+            // Wait for the end-of-list chunk (subtype 03), up to four seconds.
+            for _ in 0..<20 where !mediaChunks.contains(where: { $0.count > 1 && $0[1] == 0x03 }) { await pause(0.2) }
+            let data = mediaChunks.filter { $0.count > 10 && $0[1] == 0x01 }.flatMap { $0.dropFirst(10) }
+            let paths = OsmoClips.paths(in: Array(data))
+            note("Clip list (\(storage == 1 ? "internal" : "card")): \(paths.count) clip\(paths.count == 1 ? "" : "s")")
+            out += paths.map { ($0, storage) }
+        }
+        return out
+    }
+
+    /// The camera's own hotspot name and password, read over Bluetooth. Never logged.
+    func hotspotLogin() async -> (ssid: String, password: String)? {
+        guard useDUML, state.isReady else { return nil }
+        guard let n = await bleRequest(DUML.getWiFiName(seq: nextDUMLSeq()), timeout: 8)?.payload,
+              let ssid = OsmoClips.packedString(n) else { note("Camera didn't give its hotspot name"); return nil }
+        await pause(0.5)
+        guard let p = await bleRequest(DUML.getWiFiPassword(seq: nextDUMLSeq()), timeout: 8)?.payload,
+              let password = OsmoClips.packedString(p) else { note("Camera didn't give its hotspot password"); return nil }
+        note("Camera hotspot: \(ssid)")
+        return (ssid, password)
+    }
+
+    /// Takes the camera off your Wi-Fi and back onto its own hotspot, where it serves files.
+    func switchToHotspot() async -> Bool {
+        guard useDUML, state.isReady else { return false }
+        disconnectWiFi()
+        let r = await bleRequest(DUML.stationMode(false, seq: nextDUMLSeq()), timeout: 12)?.payload
+        note("Hotspot switch reply: \(r.map { Self.hex($0) } ?? "none")")
+        for _ in 0..<10 {
+            await pause(2)
+            let role = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 6)?.payload ?? []
+            if DUMLStation.role(role) == .accessPoint { note("Camera is on its own hotspot"); return true }
+        }
+        // The readback isn't always clear; the Mac's join decides.
+        note("Camera hotspot role unconfirmed; trying to join anyway")
+        return r != nil
+    }
+
     private func freshStatus() -> DUMLCameraStatus? {
         Date().timeIntervalSince(wifiCamStatusAt) < 3 ? wifiCamStatus : nil
     }
