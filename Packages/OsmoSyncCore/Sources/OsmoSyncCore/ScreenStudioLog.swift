@@ -47,20 +47,29 @@ public enum ScreenStudioLog {
 
 /// Follows the newest Screen Studio project's log and reports recording start and stop.
 /// Call `poll()` on a timer; it reads only the bytes added since the last call.
+///
+/// While recording, Screen Studio keeps the project in its "Recordings In Progress" folder and
+/// moves it to the projects folder only after it stops. So both folders are watched, and a
+/// project keeps its read position when it moves (same folder name), so no event fires twice.
 public final class ScreenStudioLogTailer {
-    public let projectsFolder: URL
-    private var currentLog: URL?
+    /// Where Screen Studio 3.x keeps a project while it records.
+    public static let inProgressFolder = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Screen Studio/Screen Studio Recordings In Progress")
+
+    public let folders: [URL]
+    private var currentName: String?
     private var offset: UInt64 = 0
     private var partial = ""
     private let startedAt: Date
 
-    public init(projectsFolder: URL, now: Date = Date()) {
-        self.projectsFolder = projectsFolder
+    public init(folders: [URL], now: Date = Date()) {
+        self.folders = folders
         self.startedAt = now
     }
 
-    /// The project folder of the log being followed.
-    public var currentProject: URL? { currentLog?.deletingLastPathComponent().deletingLastPathComponent() }
+    public convenience init(projectsFolder: URL, now: Date = Date()) {
+        self.init(folders: [Self.inProgressFolder, projectsFolder], now: now)
+    }
 
     public struct Hit: Equatable {
         public let event: ScreenStudioEvent
@@ -69,15 +78,14 @@ public final class ScreenStudioLogTailer {
     }
 
     public func poll() -> [Hit] {
-        let fm = FileManager.default
-        guard let newest = newestProject() else { return [] }
-        let log = newest.appendingPathComponent("recording/polyrecorder.log")
-        if log != currentLog {
-            // Ignore projects made before the app started, so old recordings never fire events.
-            let created = (try? newest.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-            guard created >= startedAt.addingTimeInterval(-5) else { return [] }
-            guard fm.fileExists(atPath: log.path) else { return [] }
-            currentLog = log
+        guard let (project, born) = newestProject() else { return [] }
+        let log = project.appendingPathComponent("recording/polyrecorder.log")
+        let name = project.lastPathComponent
+        if name != currentName {
+            // Ignore projects begun before the app started, so old recordings never fire events.
+            guard born >= startedAt.addingTimeInterval(-5) else { return [] }
+            guard FileManager.default.fileExists(atPath: log.path) else { return [] }
+            currentName = name
             offset = 0
             partial = ""
         }
@@ -93,20 +101,26 @@ public final class ScreenStudioLogTailer {
         var lines = text.components(separatedBy: "\n")
         partial = lines.removeLast()
         return lines.compactMap { line in
-            ScreenStudioLog.event(in: line).map { Hit(event: $0, time: ScreenStudioLog.timestamp(of: line), project: newest) }
+            ScreenStudioLog.event(in: line).map { Hit(event: $0, time: ScreenStudioLog.timestamp(of: line), project: project) }
         }
     }
 
-    private func newestProject() -> URL? {
-        let keys: [URLResourceKey] = [.creationDateKey, .isDirectoryKey]
-        guard let items = try? FileManager.default.contentsOfDirectory(
-            at: projectsFolder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { return nil }
-        return items
-            .filter { $0.pathExtension == "screenstudio" }
-            .max { a, b in
-                let da = (try? a.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                let db = (try? b.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                return da < db
+    /// The project whose recording began last, across all watched folders. Dated by its
+    /// `recording` folder, which is made when recording starts; the project folder itself is
+    /// made when Screen Studio moves it into place at the end.
+    private func newestProject() -> (URL, Date)? {
+        let fm = FileManager.default
+        var best: (URL, Date)?
+        for folder in folders {
+            guard let items = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.creationDateKey],
+                                                          options: [.skipsHiddenFiles]) else { continue }
+            for p in items where p.pathExtension == "screenstudio" {
+                let rec = p.appendingPathComponent("recording")
+                let born = (try? rec.resourceValues(forKeys: [.creationDateKey]).creationDate)
+                    ?? (try? p.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+                if best == nil || born > best!.1 { best = (p, born) }
             }
+        }
+        return best
     }
 }

@@ -56,6 +56,7 @@ final class AppModel: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private var tailer: ScreenStudioLogTailer?
+    private var startTask: Task<Bool, Never>?
     private var timer: Timer?
 
     init() {
@@ -174,9 +175,21 @@ final class AppModel: ObservableObject {
 
     private func pollScreenStudio() {
         guard let tailer else { return }
-        for hit in tailer.poll() {
+        let hits = tailer.poll()
+        for (i, hit) in hits.enumerated() {
             switch hit.event {
-            case .starting: screenStudioStarted(project: hit.project, at: hit.time ?? Date())
+            case .starting:
+                // Never start the camera for a recording that has already ended: a start seen
+                // together with its own stop, or a start line from long ago.
+                if hits[(i + 1)...].contains(where: { $0.event != .starting }) {
+                    camera.note("Screen Studio start and stop arrived together; not starting the camera")
+                    continue
+                }
+                if let t = hit.time, Date().timeIntervalSince(t) > 30 {
+                    camera.note("Ignoring a Screen Studio start from \(Int(Date().timeIntervalSince(t)))s ago")
+                    continue
+                }
+                screenStudioStarted(project: hit.project, at: hit.time ?? Date())
             case .stopping, .stopped: screenStudioStopped(at: hit.time ?? Date())
             }
         }
@@ -190,11 +203,14 @@ final class AppModel: ObservableObject {
         camera.note("Screen Studio started recording: \(name)")
         guard autoRecord else { addTake(take); return }
         addTake(take)
-        Task {
+        startTask = Task {
             let ok = await camera.startRecording()
             take.cameraStarted = ok
             updateTake(take)
-            if !ok { notify("Osmo didn't start", camera.state.isReady ? "The camera didn't confirm recording." : "The camera isn't connected.") }
+            if !ok, screenStudioRecording {
+                notify("Osmo didn't start", camera.state.isReady ? "The camera didn't confirm recording." : "The camera isn't connected.")
+            }
+            return ok
         }
     }
 
@@ -205,8 +221,14 @@ final class AppModel: ObservableObject {
         guard var take = takes.first(where: \.isOpen) else { return }
         take.end = time
         updateTake(take)
-        guard autoRecord, camera.isRecording || take.cameraStarted else { return }
+        guard autoRecord else { return }
+        let pending = startTask
+        startTask = nil
         Task {
+            // If the start is still in flight, let it finish, then stop: otherwise the camera
+            // would start after Screen Studio has already stopped and keep recording.
+            let started = await pending?.value ?? false
+            guard started || camera.isRecording || take.cameraStarted else { return }
             await camera.stopRecording()
             if autoImport { importPending() }
         }
