@@ -234,7 +234,7 @@ final class AppModel: ObservableObject {
             if cameraCardMounted {
                 importPending()
             } else {
-                notify("Copy the Osmo clip", "Swipe down on the Pocket and set USB mode to file transfer. OsmoSync copies it when the drive appears.")
+                notify("Copy the Osmo clip", "Unplug the Pocket's USB-C, plug it back in and tap File Transfer. OsmoSync copies it when the drive appears.")
             }
         }
     }

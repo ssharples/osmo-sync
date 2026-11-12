@@ -155,7 +155,7 @@ struct MenuView: View {
                     .disabled(model.importing)
             }
             if model.takes.contains(where: \.needsImport), !model.cameraCardMounted, !model.importing {
-                Label("To copy the clip, swipe down on the Pocket and set USB mode to file transfer. OsmoSync copies it as soon as the drive appears.",
+                Label("To copy the clip, unplug the Pocket's USB-C, plug it back in and tap File Transfer on its screen. OsmoSync copies it as soon as the drive appears.",
                       systemImage: "cable.connector")
                     .font(.caption).foregroundStyle(.orange)
             }
