@@ -54,6 +54,66 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.volumeMounted(url) }
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        if CommandLine.arguments.contains("--probe") { runProbe() }
+    }
+
+    // MARK: Probe
+
+    /// `open OsmoSync.app --args --probe`: find the camera, pair, record ~6 seconds, stop.
+    /// Everything goes to ~/Library/Logs/OsmoSync.log.
+    private func runProbe() {
+        camera.trace = true
+        camera.note("PROBE: started")
+        Task { @MainActor in
+            func wait(_ s: Double) async { try? await Task.sleep(for: .seconds(s)) }
+            // Bluetooth can take several seconds to power on; a saved camera then reconnects by itself.
+            var scanned = false
+            for _ in 0..<60 {
+                switch camera.state {
+                case .ready, .connecting, .waitingForApproval: break
+                case .notAllowed: camera.note("PROBE: Bluetooth not allowed"); return
+                default:
+                    if let cam = camera.found.max(by: { $0.rssi < $1.rssi }) {
+                        camera.note("PROBE: connecting to \(cam.name)")
+                        camera.connect(to: cam.id)
+                    } else if camera.bluetoothOn, !scanned, !camera.hasSavedCamera || camera.state != .idle {
+                        scanned = true
+                        camera.scan()
+                    }
+                    await wait(0.5)
+                    continue
+                }
+                break
+            }
+            for _ in 0..<120 where !camera.state.isReady {
+                if case .failed = camera.state { camera.note("PROBE: gave up: \(camera.state.label)"); return }
+                await wait(0.5)
+            }
+            guard camera.state.isReady else { camera.note("PROBE: not connected after 60s"); return }
+            await wait(3)
+            camera.note("PROBE: status \(camera.status.map { "\($0.modeName), recording \($0.isRecording)" } ?? "none yet")")
+            if CommandLine.arguments.contains("--variants") {
+                // seq big-endian on the wire; a small seq; the camera as receiver id 1 type 1.
+                for (label, seq, rx) in [("seq BE", UInt16(0x0381), UInt8(0x01)), ("seq small", UInt16(0x0004), UInt8(0x01)),
+                                          ("rx 0x21", UInt16(0x8105), UInt8(0x21))] {
+                    camera.note("PROBE: start variant \(label)")
+                    camera.probeRecord(start: true, seq: seq, receiver: rx)
+                    await wait(5)
+                    camera.note("PROBE: stop variant \(label)")
+                    camera.probeRecord(start: false, seq: seq &+ 0x0100, receiver: rx)
+                    await wait(4)
+                }
+            } else {
+                let started = await camera.startRecording()
+                camera.note("PROBE: start -> \(started)")
+                await wait(6)
+                let stopped = await camera.stopRecording()
+                camera.note("PROBE: stop -> \(stopped)")
+            }
+            await wait(2)
+            camera.trace = false
+            camera.note("PROBE: done")
+        }
     }
 
     // MARK: Screen Studio

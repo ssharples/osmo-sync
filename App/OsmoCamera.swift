@@ -5,8 +5,9 @@ import os
 
 private let logger = Logger(subsystem: "com.ssharples.OsmoSync", category: "app")
 
-/// Talks to an Osmo camera over Bluetooth using DJI's R-SDK remote protocol:
-/// pair once (approve on the camera's screen), then start and stop recording.
+/// Talks to an Osmo camera over Bluetooth: pair once (approve on the camera's screen),
+/// then start and stop recording. Osmo Pocket cameras speak DUML; Action and 360
+/// cameras speak DJI's published R-SDK.
 @MainActor
 final class OsmoCamera: NSObject, ObservableObject {
     enum State: Equatable {
@@ -47,6 +48,9 @@ final class OsmoCamera: NSObject, ObservableObject {
     @Published private(set) var log: [String] = []
 
     var onRecordingChanged: ((Bool) -> Void)?
+    /// Logs every frame sent and received. On with `--probe`.
+    var trace = false
+    private var seenNames: Set<String> = []
 
     private static let service = CBUUID(string: "FFF0")
     private static let notifyChar = CBUUID(string: "FFF4")
@@ -66,6 +70,17 @@ final class OsmoCamera: NSObject, ObservableObject {
     private var lastStatusAt = Date.distantPast
     private var recordWaiters: [UInt16: CheckedContinuation<Bool, Never>] = [:]
     private var wantConnection = false
+
+    // DUML (Osmo Pocket) state
+    private var useDUML = false
+    private var notifyTarget: CBCharacteristic?
+    private var dumlAssemblers: [CBUUID: DUMLFrameAssembler] = [:]
+    private var dumlSeq: UInt16 = 0x8100
+    private var writeQueue: [Data] = []
+    private var writing = false
+    private var keepaliveTimer: Timer?
+    /// Pockets don't send a status feed over Bluetooth, so track recording from our own commands.
+    @Published private(set) var dumlRecording = false
 
     private let defaults = UserDefaults.standard
 
@@ -89,13 +104,22 @@ final class OsmoCamera: NSObject, ObservableObject {
         set { defaults.set(newValue?.uuidString, forKey: "cameraID") }
     }
 
+    /// The id the camera files its approval under, so it recognises us next time.
+    private lazy var dumlIdentifier: String = {
+        if let v = defaults.string(forKey: "dumlIdentifier"), v.count == 32 { return v }
+        let v = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        defaults.set(v, forKey: "dumlIdentifier")
+        return v
+    }()
+
     private var pairedCameras: Set<String> {
         get { Set(defaults.stringArray(forKey: "pairedCameras") ?? []) }
         set { defaults.set(Array(newValue), forKey: "pairedCameras") }
     }
 
     var hasSavedCamera: Bool { savedCameraID != nil }
-    var isRecording: Bool { status?.isRecording ?? false }
+    var bluetoothOn: Bool { central.state == .poweredOn }
+    var isRecording: Bool { useDUML ? dumlRecording : (status?.isRecording ?? false) }
 
     override init() {
         super.init()
@@ -147,17 +171,18 @@ final class OsmoCamera: NSObject, ObservableObject {
 
     /// Starts recording. Returns true when the camera confirms.
     @discardableResult
-    func startRecording() async -> Bool { await sendRecord(start: true) }
+    func startRecording() async -> Bool { useDUML ? await sendDUMLRecord(start: true) : await sendRecord(start: true) }
 
     /// Stops recording. Returns true when the camera confirms.
     @discardableResult
-    func stopRecording() async -> Bool { await sendRecord(start: false) }
+    func stopRecording() async -> Bool { useDUML ? await sendDUMLRecord(start: false) : await sendRecord(start: false) }
 
     // MARK: Internals
 
     private func open(_ p: CBPeripheral) {
         reset()
         peripheral = p
+        useDUML = Self.speaksDUML(p.name)
         p.delegate = self
         state = .connecting(p.name ?? "camera")
         central.connect(p)
@@ -167,7 +192,13 @@ final class OsmoCamera: NSObject, ObservableObject {
     private func reset() {
         approvalTimer?.invalidate(); approvalTimer = nil
         statusTimer?.invalidate(); statusTimer = nil
+        keepaliveTimer?.invalidate(); keepaliveTimer = nil
         writeTarget = nil
+        notifyTarget = nil
+        dumlAssemblers = [:]
+        writeQueue = []
+        writing = false
+        dumlRecording = false
         assemblers = [:]
         pendingNotify = 0
         status = nil
@@ -185,6 +216,7 @@ final class OsmoCamera: NSObject, ObservableObject {
         let useSeq = s ?? nextSeq()
         guard let p = peripheral, let c = writeTarget else { return useSeq }
         let frame = RSDK.frame(cmdSet: set, cmdID: id, cmdType: type, payload: payload, seq: useSeq)
+        if trace { note(String(format: "TX %02X/%02X type %02X seq %d: ", set, id, type, useSeq) + Self.hex(frame)) }
         p.writeValue(Data(frame), for: c, type: .withoutResponse)
         return useSeq
     }
@@ -210,6 +242,7 @@ final class OsmoCamera: NSObject, ObservableObject {
         case (RSDK.setCamera, RSDK.idStatusPush):
             guard let s = RSDK.cameraStatus(f.payload) else { return }
             lastStatusAt = Date()
+            if trace, s != status { note("Status: \(s.modeName), recording \(s.isRecording), battery \(s.battery)%") }
             let was = status?.isRecording
             status = s
             if was != s.isRecording { onRecordingChanged?(s.isRecording) }
@@ -281,6 +314,115 @@ final class OsmoCamera: NSObject, ObservableObject {
         return ok
     }
 
+    // MARK: DUML (Osmo Pocket)
+
+    static func speaksDUML(_ name: String?) -> Bool {
+        (name ?? "").localizedCaseInsensitiveContains("pocket")
+    }
+
+    private func nextDUMLSeq() -> UInt16 { dumlSeq = dumlSeq &+ 1; if dumlSeq < 0x8100 { dumlSeq = 0x8100 }; return dumlSeq }
+
+    /// Writes go out one at a time, 120 ms apart; the camera drops writes sent faster.
+    private func sendDUML(_ f: DUML.Frame) {
+        let bytes = DUML.encode(f)
+        if trace, !(f.cmdSet == 0x00 && f.cmdID == 0x2B && f.payload == [1, 1]) {
+            note(String(format: "TX %02X/%02X flags %02X seq %04X: ", f.cmdSet, f.cmdID, f.flags, f.seq) + Self.hex(bytes))
+        }
+        writeQueue.append(Data(bytes))
+        pumpWrites()
+    }
+
+    private func pumpWrites() {
+        guard !writing, !writeQueue.isEmpty, let p = peripheral, let c = writeTarget else { return }
+        writing = true
+        p.writeValue(writeQueue.removeFirst(), for: c, type: .withoutResponse)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.writing = false
+            self?.pumpWrites()
+        }
+    }
+
+    /// Notifications are on; arm app pairing by writing 01 00 to FFF4.
+    private func armDUMLPairing() {
+        guard let p = peripheral, let n = notifyTarget else { return }
+        note("Arming pairing")
+        p.writeValue(Data([0x01, 0x00]), for: n, type: .withResponse)
+    }
+
+    private func beginDUMLHandshake() {
+        state = .waitingForApproval(name)
+        note("Pairing: approve the request on the camera's screen (it shows OSMO)")
+        sendDUML(DUML.sessionWake())
+        sendDUML(DUML.setPairingPin(identifier: dumlIdentifier))
+        approvalTimer?.invalidate()
+        approvalTimer = Timer.scheduledTimer(withTimeInterval: 45, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.fail("The camera didn't approve the connection. Try again and tap OK on its screen.") }
+        }
+        keepaliveTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.sendDUML(DUML.sessionKeepalive()) }
+        }
+    }
+
+    private func dumlReady() {
+        guard !state.isReady else { return }
+        approvalTimer?.invalidate(); approvalTimer = nil
+        if let p = peripheral { pairedCameras.insert(p.identifier.uuidString) }
+        state = .ready(name)
+        note("Connected to \(name)")
+    }
+
+    private func handleDUML(_ f: DUML.Frame) {
+        switch (f.cmdSet, f.cmdID) {
+        case (0x07, 0x45) where f.isResponse:
+            switch DUML.pairingReply(f.payload) {
+            case .alreadyPaired: dumlReady()
+            case .needsApproval: note("Waiting for you to approve on the camera")
+            case .deferred: fail("The camera is busy pairing. Try again in a few seconds.")
+            case .other(let c): note("Pairing reply code \(c)")
+            }
+        case (0x07, 0x46) where !f.isResponse:
+            sendDUML(DUML.pairApprovalAck(seq: f.seq))
+            dumlReady()
+        case (0x02, 0x02) where f.isResponse:
+            let ok = f.payload.first == 0
+            if !ok { note("Camera refused record command (code \(f.payload.first.map { String(format: "%02X", $0) } ?? "none"))") }
+            recordWaiters.removeValue(forKey: f.seq)?.resume(returning: ok)
+        default:
+            if trace, !(f.cmdSet == 0x00 && f.cmdID == 0x2B) {
+                note(String(format: "RX %02X/%02X flags %02X from %02X: ", f.cmdSet, f.cmdID, f.flags, f.sender) + Self.hex(f.payload))
+            }
+        }
+    }
+
+    /// Probe only: send a record frame with a chosen seq and receiver.
+    func probeRecord(start: Bool, seq: UInt16, receiver: UInt8 = DUML.rxCamera) {
+        var f = DUML.record(start: start, seq: seq)
+        f.receiver = receiver
+        sendDUML(f)
+    }
+
+    private func sendDUMLRecord(start: Bool) async -> Bool {
+        guard state.isReady else {
+            note("Can't \(start ? "start" : "stop") recording: camera not connected")
+            return false
+        }
+        let s = nextDUMLSeq()
+        sendDUML(DUML.record(start: start, seq: s))
+        note(start ? "Sent: start recording" : "Sent: stop recording")
+        let ok = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+            recordWaiters[s] = c
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                self?.recordWaiters.removeValue(forKey: s)?.resume(returning: false)
+            }
+        }
+        if ok {
+            dumlRecording = start
+            onRecordingChanged?(start)
+        }
+        note(ok ? (start ? "Camera is recording" : "Camera stopped") : "Camera did not confirm")
+        return ok
+    }
+
     private func fail(_ why: String) {
         note(why)
         wantConnection = false
@@ -293,8 +435,25 @@ final class OsmoCamera: NSObject, ObservableObject {
         let stamp = Date().formatted(date: .omitted, time: .standard)
         logger.notice("\(s, privacy: .public)")
         log.append("\(stamp)  \(s)")
+        Self.appendToFile("\(Date().ISO8601Format())  \(s)\n")
         if log.count > 200 { log.removeFirst(log.count - 200) }
     }
+}
+
+extension OsmoCamera {
+    /// ~/Library/Logs/OsmoSync.log, so a test run can be read afterwards.
+    static let logFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/OsmoSync.log")
+
+    static func appendToFile(_ line: String) {
+        let data = Data(line.utf8)
+        if let h = try? FileHandle(forWritingTo: logFile) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: logFile)
+        }
+    }
+
+    static func hex(_ b: [UInt8]) -> String { b.map { String(format: "%02X", $0) }.joined(separator: " ") }
 }
 
 extension OsmoCamera: CBCentralManagerDelegate {
@@ -317,6 +476,10 @@ extension OsmoCamera: CBCentralManagerDelegate {
         let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         MainActor.assumeIsolated {
             let n = local ?? p.name ?? ""
+            if trace, !n.isEmpty, peripherals[p.identifier] == nil, !seenNames.contains(n) {
+                seenNames.insert(n)
+                note("Saw \(n) (rssi \(rssi), services \(services.map(\.uuidString)))")
+            }
             let looksDJI = n.localizedCaseInsensitiveContains("osmo") || n.localizedCaseInsensitiveContains("pocket")
                 || n.localizedCaseInsensitiveContains("dji") || services.contains(Self.service)
             guard looksDJI else { return }
@@ -376,10 +539,11 @@ extension OsmoCamera: CBPeripheralDelegate {
                 return
             }
             writeTarget = w
+            notifyTarget = chars.first(where: { $0.uuid == Self.notifyChar })
             let notifiable = chars.filter { $0.properties.contains(.notify) || $0.properties.contains(.indicate) }
             pendingNotify = notifiable.count
             for c in notifiable { p.setNotifyValue(true, for: c) }
-            if pendingNotify == 0 { beginHandshake() }
+            if pendingNotify == 0 { useDUML ? armDUMLPairing() : beginHandshake() }
         }
     }
 
@@ -387,19 +551,37 @@ extension OsmoCamera: CBPeripheralDelegate {
         MainActor.assumeIsolated {
             if let error { note("Notify on \(c.uuid) failed: \(error.localizedDescription)") }
             pendingNotify -= 1
-            if pendingNotify == 0 { beginHandshake() }
+            if pendingNotify == 0 { useDUML ? armDUMLPairing() : beginHandshake() }
+        }
+    }
+
+    nonisolated func peripheral(_ p: CBPeripheral, didWriteValueFor c: CBCharacteristic, error: Error?) {
+        MainActor.assumeIsolated {
+            guard useDUML, c.uuid == Self.notifyChar else { return }
+            if let error { note("Arming pairing failed: \(error.localizedDescription)") }
+            beginDUMLHandshake()
         }
     }
 
     nonisolated func peripheral(_ p: CBPeripheral, didUpdateValueFor c: CBCharacteristic, error: Error?) {
         let bytes = c.value.map { [UInt8]($0) } ?? []
         MainActor.assumeIsolated {
+            if useDUML {
+                var asm = dumlAssemblers[c.uuid] ?? DUMLFrameAssembler()
+                let frames = asm.append(bytes)
+                dumlAssemblers[c.uuid] = asm
+                for raw in frames {
+                    if let f = DUML.parse(raw) { handleDUML(f) } else if trace { note("RX bad DUML frame: " + Self.hex(raw)) }
+                }
+                return
+            }
             // Each characteristic is its own byte stream; keep their fragments apart.
             var asm = assemblers[c.uuid] ?? RSDKFrameAssembler()
             let frames = asm.append(bytes)
             assemblers[c.uuid] = asm
             for raw in frames {
-                if let f = RSDK.parse(raw) { handle(f) }
+                if trace { note("RX \(c.uuid): " + Self.hex(raw)) }
+                if let f = RSDK.parse(raw) { handle(f) } else if trace { note("RX frame failed to parse") }
             }
         }
     }

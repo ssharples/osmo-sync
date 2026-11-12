@@ -122,3 +122,41 @@ final class CameraMediaTests: XCTestCase {
         XCTAssertEqual(picked.map(\.lastPathComponent), ["b.MP4", "c.MP4"])
     }
 }
+
+// MARK: DUML (Osmo Pocket)
+
+final class DUMLTests: XCTestCase {
+    /// Byte vectors from the Osmosis / OpenCine test suites.
+    func testEncodesKnownFrames() {
+        XCTAssertEqual(DUML.crc8([0x55, 0x11, 0x04][...]), 0x92)
+        let playback = DUML.encode(.init(receiver: DUML.rxCamera, seq: 0xA000, flags: DUML.flagRequest,
+                                         cmdSet: 0x02, cmdID: 0x0C, payload: [0x01, 0x01, 0x00, 0x01]))
+        XCTAssertEqual(playback, [0x55, 0x11, 0x04, 0x92, 0x02, 0x01, 0x00, 0xA0,
+                                  0x40, 0x02, 0x0C, 0x01, 0x01, 0x00, 0x01, 0xB6, 0x3B])
+        let pin = DUML.encode(DUML.setPairingPin(identifier: "284ae5b8d76b3375a04a6417ad71bea3"))
+        XCTAssertEqual(pin.count, 51)
+        XCTAssertEqual(Array(pin.prefix(11)), [0x55, 0x33, 0x04, 0xC2, 0x02, 0x07, 0x92, 0x80, 0x40, 0x07, 0x45])
+        XCTAssertEqual(Array(pin.suffix(2)), [0xA0, 0xB4])
+    }
+
+    func testParsesAndAssembles() {
+        let rec = DUML.encode(DUML.record(start: true, seq: 0x8101))
+        XCTAssertEqual(DUML.parse(rec)?.payload, [0x01])
+        var bad = rec; bad[11] ^= 0xFF
+        XCTAssertNil(DUML.parse(bad))
+
+        let reply = DUML.encode(.init(sender: 0x01, receiver: 0x02, seq: 0x8101, flags: DUML.flagResponse,
+                                      cmdSet: 0x02, cmdID: 0x02, payload: [0x00]))
+        var asm = DUMLFrameAssembler()
+        let stream = [0x00, 0x55, 0x01] + rec + reply  // junk, a stray SOF, then two frames
+        XCTAssertEqual(asm.append(Array(stream[0..<9])), [])
+        XCTAssertEqual(asm.append(Array(stream[9...])), [rec, reply])
+        XCTAssertTrue(DUML.parse(reply)!.isResponse)
+    }
+
+    func testPairingReply() {
+        XCTAssertEqual(DUML.pairingReply([0x00, 0x01]), .alreadyPaired)
+        XCTAssertEqual(DUML.pairingReply([0x00, 0x02]), .needsApproval)
+        XCTAssertEqual(DUML.pairingReply([0x00, 0x06]), .deferred)
+    }
+}
