@@ -159,3 +159,21 @@ public enum DUMLStation {
         }
     }
 }
+
+/// The camera's `0x02/0x80` status push, sent about once a second. Bit layout from OpenCine's
+/// `CameraStatusDecoder`: flags word bit 7 = recording, bit 30 = in playback.
+public struct DUMLCameraStatus: Equatable {
+    public var isRecording: Bool
+    public var inPlayback: Bool
+    /// Seconds into the current clip (0 when idle), when the push carries it.
+    public var elapsed: Int?
+
+    public init?(_ f: DUML.Frame) {
+        guard f.cmdSet == 0x02, f.cmdID == 0x80, f.payload.count >= 13 else { return nil }
+        let p = f.payload
+        let flags = UInt32(p[0]) | UInt32(p[1]) << 8 | UInt32(p[2]) << 16 | UInt32(p[3]) << 24
+        isRecording = flags & 0x80 != 0
+        inPlayback = flags & 0x4000_0000 != 0
+        elapsed = p.count >= 31 ? Int(p[29]) | Int(p[30]) << 8 : nil
+    }
+}

@@ -40,6 +40,8 @@ final class OsmoDatalink {
     private(set) var isOpen = false
     private(set) var lastHeard = Date.distantPast
     var trace = false
+    /// Frames the camera sends on its own, such as the `0x02/0x80` status push.
+    var onPush: ((DUML.Frame) -> Void)?
 
     init(host: String, identifier: String, log: @escaping (String) -> Void) {
         self.host = host
@@ -192,6 +194,7 @@ final class OsmoDatalink {
         default:
             break
         }
+        for f in DUMLDatalink.frames(in: d) where !f.isResponse { onPush?(f) }
         for f in DUMLDatalink.frames(in: d) where f.isResponse {
             if trace, !(f.cmdSet == 0 && (f.cmdID == 0x88 || f.cmdID == 0x81)) {
                 log(String(format: "WiFi RX %02X/%02X: ", f.cmdSet, f.cmdID) + OsmoCamera.hex(f.payload))

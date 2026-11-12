@@ -133,6 +133,9 @@ final class OsmoCamera: NSObject, ObservableObject {
     }
 
     var wifiLinkOpen: Bool { datalink?.isOpen == true }
+    /// The latest `0x02/0x80` status the camera pushed over Wi-Fi.
+    private var wifiCamStatus: DUMLCameraStatus?
+    private var wifiCamStatusAt = Date.distantPast
 
     private var pairedCameras: Set<String> {
         get { Set(defaults.stringArray(forKey: "pairedCameras") ?? []) }
@@ -350,7 +353,9 @@ final class OsmoCamera: NSObject, ObservableObject {
     private func sendDUML(_ f: DUML.Frame) {
         let bytes = DUML.encode(f)
         if trace, !(f.cmdSet == 0x00 && f.cmdID == 0x2B && f.payload == [1, 1]) {
-            note(String(format: "TX %02X/%02X flags %02X seq %04X: ", f.cmdSet, f.cmdID, f.flags, f.seq) + Self.hex(bytes))
+            // 07/47 carries the Wi-Fi password, so never write its bytes to the log.
+            let shown = f.cmdSet == 0x07 && f.cmdID == 0x47 ? "(Wi-Fi details hidden)" : Self.hex(bytes)
+            note(String(format: "TX %02X/%02X flags %02X seq %04X: ", f.cmdSet, f.cmdID, f.flags, f.seq) + shown)
         }
         writeQueue.append(Data(bytes))
         pumpWrites()
@@ -443,18 +448,43 @@ final class OsmoCamera: NSObject, ObservableObject {
             note("Can't \(start ? "start" : "stop") recording: the camera isn't on Wi-Fi")
             return false
         }
+        if let st = freshStatus(), st.inPlayback {
+            note("The camera is showing playback; it won't record until you leave it")
+        }
         note(start ? "Sent: start recording (Wi-Fi)" : "Sent: stop recording (Wi-Fi)")
         let reply = await link.request(DUML.record(start: start, seq: 0), timeout: 5)
         let code = reply?.payload.first
-        // 0xDF answers "start" while already recording.
-        let ok = code == 0 || (start && code == 0xDF)
-        if let code, !ok { note(String(format: "Camera refused record command (code %02X)", code)) }
+        if let code { note(String(format: "Record reply code %02X", code)) }
+        // The reply code is ambiguous (0xDF answers both "already recording" and some refusals),
+        // so trust the camera's own status push when it sends one.
+        var ok: Bool
+        if let seen = await waitForRecording(start, within: 4) {
+            ok = seen == start
+        } else {
+            ok = code == 0
+            note("No status from the camera; going by the reply code")
+        }
+        if !ok, let code { note(String(format: "Camera refused record command (code %02X)", code)) }
         if ok {
             dumlRecording = start
             onRecordingChanged?(start)
         }
         note(ok ? (start ? "Camera is recording" : "Camera stopped") : reply == nil ? "Camera did not confirm" : "Camera refused")
         return ok
+    }
+
+    private func freshStatus() -> DUMLCameraStatus? {
+        Date().timeIntervalSince(wifiCamStatusAt) < 3 ? wifiCamStatus : nil
+    }
+
+    /// Waits for the status push to show `want`. Returns the last state seen, or nil if none came.
+    private func waitForRecording(_ want: Bool, within s: Double) async -> Bool? {
+        let deadline = Date().addingTimeInterval(s)
+        while Date() < deadline {
+            if let st = freshStatus(), st.isRecording == want { return want }
+            await pause(0.2)
+        }
+        return freshStatus()?.isRecording
     }
 
     // MARK: Wi-Fi (camera joins your network)
@@ -494,18 +524,17 @@ final class OsmoCamera: NSObject, ObservableObject {
         let roleReply = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 12)?.payload ?? []
         let role = DUMLStation.role(roleReply)
         note("Camera Wi-Fi role: \(role) (\(Self.hex(roleReply)))")
-        if role == .station {
+        if role != .accessPoint {
+            // Already on a network, or a reply we haven't seen (a Pocket 4P after a firmware
+            // update answered 00 08). Look on the LAN first.
             wifiStatus = "Looking for the camera on \(ssid)"
-            if await findOnNetwork(within: 15) { return true }
-        } else {
-            guard role == .accessPoint else {
-                wifiStatus = "Camera didn't report its Wi-Fi mode"
-                note(wifiStatus)
-                return false
-            }
+            if await findOnNetwork(within: role == .station ? 15 : 5) { return true }
+        }
+        if role != .station {
             wifiStatus = "Switching camera to your Wi-Fi"
             let sw = await bleRequest(DUML.stationMode(true, seq: nextDUMLSeq()), timeout: 12)?.payload
-            guard sw == [0, 0] else {
+            note("Station switch reply: \(sw.map { Self.hex($0) } ?? "none")")
+            guard sw == [0, 0] || sw == [0] else {
                 wifiStatus = "Camera refused to join a network (\(Self.hex(sw ?? [])))"
                 note(wifiStatus)
                 return false
@@ -513,10 +542,14 @@ final class OsmoCamera: NSObject, ObservableObject {
             var switched = false
             for _ in 0..<6 {
                 let r = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 12)?.payload ?? []
+                note("Camera Wi-Fi role: \(Self.hex(r))")
                 if DUMLStation.role(r) == .station { switched = true; break }
+                if DUMLStation.role(r) == .unknown, r != roleReply { break }  // changed to something new
                 await pause(2)
             }
-            guard switched else {
+            // An unrecognised readback isn't proof of failure; the join reply and the
+            // identity check on the LAN decide.
+            if !switched, role == .accessPoint {
                 wifiStatus = "Camera Wi-Fi is still starting. Try again."
                 note(wifiStatus)
                 return false
@@ -584,6 +617,15 @@ final class OsmoCamera: NSObject, ObservableObject {
                 }
                 datalink?.close()
                 datalink = link
+                wifiCamStatus = nil
+                link.onPush = { [weak self] f in
+                    guard let self, let st = DUMLCameraStatus(f) else { return }
+                    if self.trace, st.isRecording != self.wifiCamStatus?.isRecording || st.inPlayback != self.wifiCamStatus?.inPlayback {
+                        self.note("Camera status: recording \(st.isRecording), playback \(st.inPlayback)")
+                    }
+                    self.wifiCamStatus = st
+                    self.wifiCamStatusAt = Date()
+                }
                 lastHost = host
                 wifiStatus = "Camera on Wi-Fi at \(host)"
                 note(wifiStatus)
