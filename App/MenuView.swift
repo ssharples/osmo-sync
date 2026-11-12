@@ -154,6 +154,11 @@ struct MenuView: View {
                 Button(model.importing ? "Copying…" : "Import now") { model.importPending() }
                     .disabled(model.importing)
             }
+            if model.takes.contains(where: \.needsImport), !model.cameraCardMounted, !model.importing {
+                Label("To copy the clip, swipe down on the Pocket and set USB mode to file transfer. OsmoSync copies it as soon as the drive appears.",
+                      systemImage: "cable.connector")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             if model.takes.isEmpty {
                 Text("Start a recording in Screen Studio and the Osmo starts with it.")
                     .font(.caption).foregroundStyle(.secondary)

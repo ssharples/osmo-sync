@@ -229,8 +229,13 @@ final class AppModel: ObservableObject {
             // would start after Screen Studio has already stopped and keep recording.
             let started = await pending?.value ?? false
             guard started || camera.isRecording || take.cameraStarted else { return }
-            await camera.stopRecording()
-            if autoImport { importPending() }
+            let stopped = await camera.stopRecording()
+            guard autoImport, stopped else { return }
+            if cameraCardMounted {
+                importPending()
+            } else {
+                notify("Copy the Osmo clip", "Swipe down on the Pocket and set USB mode to file transfer. OsmoSync copies it when the drive appears.")
+            }
         }
     }
 
