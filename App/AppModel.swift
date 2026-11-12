@@ -35,6 +35,11 @@ struct Take: Codable, Identifiable, Equatable {
     var cameraStarted: Bool
     var imported: [String] = []
     var importNote: String?
+    /// When the camera confirmed it was recording.
+    var cameraStartedAt: Date?
+    /// The lined-up copy of the first clip, and what happened when making it.
+    var synced: String?
+    var syncNote: String?
 
     var isOpen: Bool { end == nil }
     var needsImport: Bool { end != nil && cameraStarted && imported.isEmpty }
@@ -46,6 +51,7 @@ final class AppModel: ObservableObject {
 
     @Published var autoRecord: Bool { didSet { defaults.set(autoRecord, forKey: "autoRecord") } }
     @Published var autoImport: Bool { didSet { defaults.set(autoImport, forKey: "autoImport") } }
+    @Published var autoLineUp: Bool { didSet { defaults.set(autoLineUp, forKey: "autoLineUp") } }
     @Published var projectsFolder: URL { didSet { defaults.set(projectsFolder.path, forKey: "projectsFolder"); restartWatcher() } }
     @Published var destination: URL { didSet { defaults.set(destination.path, forKey: "destination") } }
     @Published private(set) var takes: [Take] = []
@@ -65,6 +71,7 @@ final class AppModel: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser
         autoRecord = defaults.object(forKey: "autoRecord") as? Bool ?? true
         autoImport = defaults.object(forKey: "autoImport") as? Bool ?? true
+        autoLineUp = defaults.object(forKey: "autoLineUp") as? Bool ?? true
         wifiSSID = defaults.string(forKey: "wifiSSID") ?? ""
         projectsFolder = URL(fileURLWithPath: defaults.string(forKey: "projectsFolder")
                              ?? home.appendingPathComponent("Screen Studio Projects").path)
@@ -88,6 +95,13 @@ final class AppModel: ObservableObject {
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         if CommandLine.arguments.contains("--probe") { runProbe() }
+        if CommandLine.arguments.contains("--line-up") {
+            // Test hook: line up every copied take that hasn't been lined up yet.
+            Task { @MainActor in
+                for take in takes where !take.imported.isEmpty && take.synced == nil { await lineUp(take) }
+                camera.note("LINE-UP TEST: done")
+            }
+        }
         if CommandLine.arguments.contains("--copy-latest") {
             // Test hook: wait for the camera and its Wi-Fi link, then copy the newest waiting take.
             Task { @MainActor in
@@ -218,6 +232,7 @@ final class AppModel: ObservableObject {
         startTask = Task {
             let ok = await camera.startRecording()
             take.cameraStarted = ok
+            if ok { take.cameraStartedAt = Date() }
             updateTake(take)
             if !ok, screenStudioRecording {
                 notify("Osmo didn't start", camera.state.isReady ? "The camera didn't confirm recording." : "The camera isn't connected.")
@@ -356,6 +371,7 @@ final class AppModel: ObservableObject {
         }
         camera.note("\(take.name): \(t.importNote ?? "")")
         updateTake(t)
+        if !copied.isEmpty, autoLineUp, let fresh = takes.first(where: { $0.id == take.id }) { await lineUp(fresh) }
         if !online { notify("Check your internet", "OsmoSync put the Mac back on \(home.ssid) but couldn't reach the internet.") }
     }
 
@@ -364,6 +380,30 @@ final class AppModel: ObservableObject {
         Task {
             if camera.isRecording { await camera.stopRecording() } else { await camera.startRecording() }
         }
+    }
+
+    // MARK: Line up with Screen Studio
+
+    /// Writes "<take> - Osmo (synced).mov", which starts at the same moment as the screen recording.
+    func lineUp(_ take: Take) async {
+        guard let clip = take.imported.first.map(URL.init(fileURLWithPath:)) else { return }
+        let project = projectsFolder.appendingPathComponent("\(take.name).screenstudio")
+        var t = take
+        t.syncNote = "Lining up…"
+        updateTake(t)
+        camera.note("Lining up \(clip.lastPathComponent) with \(project.lastPathComponent)")
+        do {
+            let o = try await LineUp.run(clip: clip, project: project, cameraStart: take.cameraStartedAt) { [weak self] in
+                self?.camera.note($0)
+            }
+            t.synced = o.output.path
+            t.syncNote = String(format: "Synced (offset %.2f s%@)", o.offset, o.method == "audio" ? "" : ", by clock")
+            camera.note("\(t.syncNote!) → \(o.output.lastPathComponent)")
+        } catch {
+            t.syncNote = "Not synced: \(error.localizedDescription)"
+            camera.note(t.syncNote!)
+        }
+        updateTake(t)
     }
 
     // MARK: Takes
@@ -382,6 +422,9 @@ final class AppModel: ObservableObject {
         merged.end = merged.end ?? t.end
         merged.imported = t.imported.isEmpty ? merged.imported : t.imported
         merged.importNote = t.importNote ?? merged.importNote
+        merged.cameraStartedAt = merged.cameraStartedAt ?? t.cameraStartedAt
+        merged.synced = t.synced ?? merged.synced
+        merged.syncNote = t.syncNote ?? merged.syncNote
         takes[i] = merged
         saveTakes()
     }
@@ -450,6 +493,12 @@ final class AppModel: ObservableObject {
                     if !copied.isEmpty { self.notify("Osmo clip imported", "\(take.name) → \(dest.lastPathComponent)") }
                 }
                 self.importing = false
+                if self.autoLineUp {
+                    let ids = Set(finished.filter { !$0.1.isEmpty }.map(\.0.id))
+                    Task { @MainActor in
+                        for t in self.takes where ids.contains(t.id) { await self.lineUp(t) }
+                    }
+                }
             }
         }
     }

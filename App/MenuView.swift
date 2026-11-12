@@ -133,6 +133,7 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 6) {
             Toggle("Record on the Osmo when Screen Studio records", isOn: $model.autoRecord)
             Toggle("Copy clips to the Mac when the camera's card mounts", isOn: $model.autoImport)
+            Toggle("Line up clips with the Screen Studio recording", isOn: $model.autoLineUp)
             HStack {
                 Text("Save to").foregroundStyle(.secondary)
                 Button(model.destination.lastPathComponent) { model.choose(folderFor: \.destination) }
@@ -174,6 +175,9 @@ struct MenuView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(t.name).font(.caption).lineLimit(1)
                     Text(takeLine(t)).font(.caption2).foregroundStyle(.secondary)
+                    if let s = t.syncNote {
+                        Text(s).font(.caption2).foregroundStyle(s.hasPrefix("Synced") ? .green : .secondary)
+                    }
                 }
             }
         }
