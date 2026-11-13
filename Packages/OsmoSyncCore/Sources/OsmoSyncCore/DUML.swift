@@ -172,6 +172,30 @@ public enum DUML {
               payload: [0x4A, 0x04, 0x0E, 0x10, 0x01, 0, 0, 0, 0, 0, 0x01, 0, 0, 0])
     }
 
+    // MARK: Gimbal and zoom (from OpenCine's captures of DJI Mimo)
+
+    public static let rxGimbal: UInt8 = 0x04
+
+    /// `0x04/0x01` virtual joystick, sent about 25 times a second while held, with no reply.
+    /// `tilt` and `pan` run −1…1 (down/left to up/right) and set the speed, not the angle.
+    public static func gimbalStick(tilt: Double, pan: Double, seq: UInt16) -> Frame {
+        let t = GimbalStick.axis(tilt), p = GimbalStick.axis(pan)
+        let payload: [UInt8] = [UInt8(t & 0xFF), UInt8(t >> 8), 0, 0, UInt8(p & 0xFF), UInt8(p >> 8), 0x00, 0x80, 0x22, 0x00]
+        return Frame(receiver: rxGimbal, seq: seq, flags: 0x00, cmdSet: 0x04, cmdID: 0x01, payload: payload)
+    }
+
+    /// `0x04/0x4C` `FE 08`: point the gimbal straight ahead again.
+    public static func gimbalRecentre(seq: UInt16) -> Frame {
+        Frame(receiver: rxGimbal, seq: seq, flags: flagRequest, cmdSet: 0x04, cmdID: 0x4C, payload: [0xFE, 0x08])
+    }
+
+    /// `0x02/0xB8` `0A 4E` + lens position: jump to a zoom factor.
+    public static func zoom(factor: Double, seq: UInt16) -> Frame {
+        let lens = Zoom.lensPosition(for: factor)
+        return Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0xB8,
+                     payload: [0x0A, 0x4E, UInt8(lens & 0xFF), UInt8(lens >> 8)])
+    }
+
     // MARK: Wi-Fi link registration
 
     /// `0x00/0x81` app device info, sent once after the UDP handshake.
@@ -221,5 +245,34 @@ public struct DUMLFrameAssembler {
             buf.removeFirst(n)
         }
         return out
+    }
+}
+
+/// Joystick values for `DUML.gimbalStick`: centre 1024, travel ±550. The camera drops
+/// frames outside 474…1574 rather than clamping them, so stay inside.
+public enum GimbalStick {
+    public static let centre: UInt16 = 1024
+    public static let travel = 550.0
+    /// Small pushes count as rest, so the gimbal doesn't creep.
+    public static let deadzone = 0.08
+
+    public static func axis(_ v: Double) -> UInt16 {
+        guard v.isFinite, abs(v) > deadzone else { return centre }
+        let c = min(max(v, -1), 1)
+        return UInt16((Double(centre) + c * travel).rounded())
+    }
+}
+
+/// Zoom factor to the camera's lens position: 217 is 1×, 651 is 3× (where the Pocket 4P
+/// switches to its telephoto camera), 2604 is 12×, straight lines between. The camera
+/// clamps to what the current resolution allows.
+public enum Zoom {
+    public static let range = 1.0...12.0
+    static let lens1x = 217.0, lens3x = 651.0, lens12x = 2604.0
+
+    public static func lensPosition(for factor: Double) -> UInt16 {
+        let f = min(max(factor.isFinite ? factor : 1, range.lowerBound), range.upperBound)
+        let v = f <= 3 ? lens1x + (f - 1) / 2 * (lens3x - lens1x) : lens3x + (f - 3) / 9 * (lens12x - lens3x)
+        return UInt16(v.rounded())
     }
 }

@@ -13,6 +13,10 @@ struct MenuView: View {
             header
             Divider()
             cameraSection
+            if camera.state.isReady {
+                Divider()
+                CameraControlsView(camera: camera)
+            }
             Divider()
             wifiSection
             Divider()

@@ -738,6 +738,61 @@ final class OsmoCamera: NSObject, ObservableObject {
         wifiStatus = ""
     }
 
+    // MARK: Pan, tilt and zoom (over the Wi-Fi link)
+
+    private var stick = (pan: 0.0, tilt: 0.0)
+    private var stickTimer: Timer?
+    private var stickLogged = false
+    @Published private(set) var zoomFactor = 1.0
+
+    var canControl: Bool { datalink?.isOpen == true }
+
+    /// Sets the joystick: −1…1 on each axis, the speed to turn at. Zero on both stops.
+    /// Frames stream every 40 ms while it's off centre, as DJI's own app does.
+    func steer(pan: Double, tilt: Double) {
+        stick = (pan, tilt)
+        let moving = GimbalStick.axis(pan) != GimbalStick.centre || GimbalStick.axis(tilt) != GimbalStick.centre
+        guard let link = datalink, link.isOpen else {
+            if moving, !stickLogged { note("Can't move the gimbal: the camera isn't on Wi-Fi"); stickLogged = true }
+            return
+        }
+        if moving {
+            if !stickLogged { note(String(format: "Gimbal stick: pan %.2f, tilt %.2f", pan, tilt)); stickLogged = true }
+            guard stickTimer == nil else { return }
+            link.send(DUML.gimbalStick(tilt: tilt, pan: pan, seq: 0))
+            stickTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, let link = self.datalink, link.isOpen else { return }
+                    link.send(DUML.gimbalStick(tilt: self.stick.tilt, pan: self.stick.pan, seq: 0))
+                }
+            }
+        } else {
+            stickTimer?.invalidate(); stickTimer = nil
+            stickLogged = false
+            // Two rest frames, in case the first is lost.
+            link.send(DUML.gimbalStick(tilt: 0, pan: 0, seq: 0))
+            link.send(DUML.gimbalStick(tilt: 0, pan: 0, seq: 0))
+        }
+    }
+
+    func recentreGimbal() {
+        guard let link = datalink, link.isOpen else { note("Can't recentre: the camera isn't on Wi-Fi"); return }
+        Task {
+            let r = await link.request(DUML.gimbalRecentre(seq: 0), timeout: 2)
+            note("Recentre gimbal: " + (r.map { Self.hex($0.payload) } ?? "no reply"))
+        }
+    }
+
+    func setZoom(_ factor: Double) {
+        let f = (min(max(factor, Zoom.range.lowerBound), Zoom.range.upperBound) * 10).rounded() / 10
+        zoomFactor = f
+        guard let link = datalink, link.isOpen else { note("Can't zoom: the camera isn't on Wi-Fi"); return }
+        Task {
+            let r = await link.request(DUML.zoom(factor: f, seq: 0), timeout: 2)
+            note(String(format: "Zoom %.1f×: ", f) + (r.map { Self.hex($0.payload) } ?? "no reply"))
+        }
+    }
+
     private var busyRetries = 0
 
     /// The camera answers "busy" for a few seconds after waking or after another app let go.
