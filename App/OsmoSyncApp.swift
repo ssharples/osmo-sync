@@ -48,8 +48,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func showWindow() {
         if window == nil {
-            let w = NSWindow(contentViewController: NSHostingController(
-                rootView: MenuView(model: model, camera: model.camera).frame(width: 340)))
+            // Fixed-size window with scrolling content. When the window followed the content's
+            // height, the jump as the camera connected (the Aim controls appearing) sent AppKit
+            // round its constraint pass until it killed the app.
+            let host = NSHostingController(rootView: ScrollView {
+                MenuView(model: model, camera: model.camera).frame(width: 340)
+            }.frame(width: 340, height: 720))
+            host.sizingOptions = []
+            let w = NSWindow(contentViewController: host)
+            w.setContentSize(NSSize(width: 340, height: 720))
             w.title = "OsmoSync"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.isReleasedWhenClosed = false

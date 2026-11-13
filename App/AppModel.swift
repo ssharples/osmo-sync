@@ -102,6 +102,20 @@ final class AppModel: ObservableObject {
                 camera.note("LINE-UP TEST: done")
             }
         }
+        if CommandLine.arguments.contains("--drop-wifi") {
+            // Test hook: knock the camera off the home Wi-Fi (as a power cycle does) and check
+            // the watchdog puts it back with nobody pressing anything.
+            Task { @MainActor in
+                for _ in 0..<180 where !(camera.state.isReady && camera.wifiLinkHealthy) { try? await Task.sleep(for: .seconds(0.5)) }
+                camera.note("DROP TEST: camera ready \(camera.state.isReady), Wi-Fi link \(camera.wifiLinkHealthy)")
+                let off = await camera.switchToHotspot()
+                camera.note("DROP TEST: camera moved to its hotspot: \(off)")
+                let started = Date()
+                try? await Task.sleep(for: .seconds(5))
+                while !camera.wifiLinkHealthy, Date().timeIntervalSince(started) < 240 { try? await Task.sleep(for: .seconds(1)) }
+                camera.note(String(format: "DROP TEST: back on Wi-Fi %@ after %.0fs", camera.wifiLinkHealthy ? "yes" : "no", Date().timeIntervalSince(started)))
+            }
+        }
         if CommandLine.arguments.contains("--copy-latest") {
             // Test hook: wait for the camera and its Wi-Fi link, then copy the newest waiting take.
             Task { @MainActor in
@@ -229,13 +243,22 @@ final class AppModel: ObservableObject {
         camera.note("Screen Studio started recording: \(name)")
         guard autoRecord else { addTake(take); return }
         addTake(take)
+        // Say so at once if the camera can't be reached, rather than after the take.
+        let reachable = camera.state.isReady && camera.wifiLinkHealthy
+        if !reachable { notify(Self.unreachableTitle, Self.unreachableBody) }
         startTask = Task {
             let ok = await camera.startRecording()
             take.cameraStarted = ok
             if ok { take.cameraStartedAt = Date() }
             updateTake(take)
-            if !ok, screenStudioRecording {
-                notify("Osmo didn't start", camera.state.isReady ? "The camera didn't confirm recording." : "The camera isn't connected.")
+            if !ok {
+                if reachable, screenStudioRecording {
+                    notify("Osmo didn't start", camera.wifiLinkOpen ? "The camera didn't confirm recording." : Self.unreachableBody)
+                }
+                // Get the camera back on Wi-Fi now, so the next take records.
+                if camera.state.isReady, !camera.wifiLinkOpen { await camera.reconnectWiFi(reason: "Record failed") }
+            } else if !reachable {
+                notify("Osmo is recording", "The camera reconnected and started.")
             }
             return ok
         }
@@ -294,6 +317,8 @@ final class AppModel: ObservableObject {
         guard let home = camera.wifiCredentials?() else { return usbFallback("OsmoSync doesn't have your Wi-Fi password.") }
         guard !camera.isRecording else { return usbFallback("The camera is still recording.") }
 
+        camera.holdWiFi = true
+        defer { camera.holdWiFi = false }
         status("Finding the clip on the camera")
         if !camera.wifiLinkOpen { await camera.findOnNetwork(within: 15) }
         var listed = await camera.listClips()
@@ -549,6 +574,9 @@ final class AppModel: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url { self[keyPath: keyPath] = url }
     }
+
+    static let unreachableTitle = "Pocket not connected"
+    static let unreachableBody = "This take won't record on the camera. OsmoSync is reconnecting it."
 
     private func notify(_ title: String, _ body: String) {
         let c = UNMutableNotificationContent()

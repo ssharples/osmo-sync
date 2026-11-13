@@ -90,6 +90,11 @@ final class OsmoCamera: NSObject, ObservableObject {
     private(set) var datalink: OsmoDatalink?
     /// Home Wi-Fi name and password, or nil when not set up. Supplied by AppModel.
     var wifiCredentials: (() -> (ssid: String, password: String)?)?
+    /// Set while something else owns the camera's Wi-Fi (the hotspot copy), so the watchdog
+    /// doesn't pull the camera back onto the home network mid-copy.
+    var holdWiFi = false
+    private var watchdog = WiFiWatchdog()
+    private var watchdogTimer: Timer?
 
     private let defaults = UserDefaults.standard
 
@@ -220,6 +225,8 @@ final class OsmoCamera: NSObject, ObservableObject {
         approvalTimer?.invalidate(); approvalTimer = nil
         statusTimer?.invalidate(); statusTimer = nil
         keepaliveTimer?.invalidate(); keepaliveTimer = nil
+        watchdogTimer?.invalidate(); watchdogTimer = nil
+        watchdog.reset()
         writeTarget = nil
         notifyTarget = nil
         dumlAssemblers = [:]
@@ -404,6 +411,46 @@ final class OsmoCamera: NSObject, ObservableObject {
         if !wifiLinkOpen, let creds = wifiCredentials?() {
             Task { await joinWiFi(ssid: creds.ssid, password: creds.password) }
         }
+        watchdog.reset()
+        watchdogTimer?.invalidate()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.watchWiFi() }
+        }
+    }
+
+    /// The Wi-Fi link counts as alive while it's open and the camera spoke recently.
+    var wifiLinkHealthy: Bool {
+        guard let link = datalink, link.isOpen else { return false }
+        return Date().timeIntervalSince(link.lastHeard) < 20
+    }
+
+    /// Runs every few seconds while Bluetooth is up. If the camera has dropped off the home
+    /// Wi-Fi (power-off, sleep, a router blip), it puts it back without anyone pressing a button.
+    private func watchWiFi() {
+        guard useDUML, wifiCredentials?() != nil else { return }
+        let action = watchdog.check(now: Date(), bleReady: state.isReady, linkHealthy: wifiLinkHealthy,
+                                    held: holdWiFi || wifiBusy || reconnecting)
+        if action == .rejoin { Task { await reconnectWiFi(reason: "Wi-Fi link down for a while") } }
+    }
+
+    private var reconnecting = false
+
+    /// Reopens the Wi-Fi link, and if the camera isn't on the network, sends the join again over
+    /// Bluetooth. Safe to call any time; it does nothing while a join or copy is running.
+    @discardableResult
+    func reconnectWiFi(reason: String) async -> Bool {
+        guard useDUML, state.isReady, !holdWiFi, !wifiBusy, !reconnecting,
+              let creds = wifiCredentials?() else { return wifiLinkHealthy }
+        reconnecting = true
+        defer { reconnecting = false }
+        note("\(reason); reconnecting the camera to \(creds.ssid)")
+        datalink?.close(); datalink = nil
+        if await findOnNetwork(within: 3) { watchdog.reset(); return true }
+        // Don't send the full join while recording: it switches the camera to video mode first.
+        guard !dumlRecording else { return false }
+        let ok = await joinWiFi(ssid: creds.ssid, password: creds.password)
+        if ok { watchdog.reset() }
+        return ok
     }
 
     private func handleDUML(_ f: DUML.Frame) {
