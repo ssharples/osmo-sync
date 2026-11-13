@@ -291,8 +291,17 @@ final class AppModel: ObservableObject {
 
         status("Finding the clip on the camera")
         if !camera.wifiLinkOpen { await camera.findOnNetwork(within: 15) }
-        let listed = await camera.listClips()
-        let wanted = OsmoClips.pick(listed.map(\.path), takeStart: take.start, takeEnd: take.end ?? take.start)
+        var listed = await camera.listClips()
+        var wanted = OsmoClips.pick(listed.map(\.path), takeStart: take.start, takeEnd: take.end ?? take.start)
+        if wanted.isEmpty {
+            // A Wi-Fi link that has been open a long while can keep answering commands yet stop
+            // sending the clip list. A fresh link fixes it, so reconnect and ask once more.
+            camera.note("No matching clip listed; reopening the Wi-Fi link and asking again")
+            camera.disconnectWiFi()
+            await camera.findOnNetwork(within: 20)
+            listed = await camera.listClips()
+            wanted = OsmoClips.pick(listed.map(\.path), takeStart: take.start, takeEnd: take.end ?? take.start)
+        }
         let clips = wanted.compactMap { w in listed.first { $0.path == w } }
         guard !clips.isEmpty else { return usbFallback("No clip on the camera matches this take.") }
         guard let login = await camera.hotspotLogin() else { return usbFallback("The camera didn't share its hotspot login.") }

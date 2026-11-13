@@ -523,13 +523,17 @@ final class OsmoCamera: NSObject, ObservableObject {
         var out: [(String, Int)] = []
         for (counter, cursor, storage) in [(UInt8(2), UInt32(0x4000_0001), 1), (UInt8(1), UInt32(1), 0)] {
             mediaChunks = []
-            _ = await link.request(DUML.mediaList(counter: counter, cursor: cursor, seq: 0), timeout: 2)
+            let reply = await link.request(DUML.mediaList(counter: counter, cursor: cursor, seq: 0), timeout: 2)
             await pause(1)
             link.send(DUML.mediaListTrigger(seq: 0))
             // Wait for the end-of-list chunk (subtype 03), up to four seconds.
             for _ in 0..<20 where !mediaChunks.contains(where: { $0.count > 1 && $0[1] == 0x03 }) { await pause(0.2) }
             let data = mediaChunks.filter { $0.count > 10 && $0[1] == 0x01 }.flatMap { $0.dropFirst(10) }
             let paths = OsmoClips.paths(in: Array(data))
+            if paths.isEmpty {
+                note("Clip list reply \(reply.map { Self.hex($0.payload) } ?? "none"), \(mediaChunks.count) chunks: "
+                     + mediaChunks.prefix(3).map { Self.hex(Array($0.prefix(24))) }.joined(separator: " | "))
+            }
             note("Clip list (\(storage == 1 ? "internal" : "card")): \(paths.count) clip\(paths.count == 1 ? "" : "s")")
             out += paths.map { ($0, storage) }
         }
