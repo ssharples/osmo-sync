@@ -222,6 +222,6 @@ struct MenuView: View {
         if t.isOpen { return "\(when) · recording" + (t.cameraStarted ? " on Osmo" : "") }
         if !t.cameraStarted { return "\(when) · Osmo didn't record" }
         if !t.imported.isEmpty { return "\(when) · copied \(t.imported.count) clip\(t.imported.count == 1 ? "" : "s")" }
-        return "\(when) · " + (t.importNote ?? "waiting for the camera's card")
+        return "\(when) · " + (t.importNote ?? "still on the camera")
     }
 }

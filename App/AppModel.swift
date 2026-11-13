@@ -248,9 +248,11 @@ final class AppModel: ObservableObject {
         guard var take = takes.first(where: \.isOpen) else { return }
         take.end = time
         updateTake(take)
-        guard autoRecord else { return }
+        // Stop the camera if OsmoSync started it for this take, even if "Record on the Osmo"
+        // was switched off mid-take: otherwise the camera keeps recording on its own.
         let pending = startTask
         startTask = nil
+        guard pending != nil || take.cameraStarted else { return }
         Task {
             // If the start is still in flight, let it finish, then stop: otherwise the camera
             // would start after Screen Studio has already stopped and keep recording.
@@ -283,7 +285,10 @@ final class AppModel: ObservableObject {
         func usbFallback(_ why: String) {
             hotspotStatus = ""
             camera.note("Wi-Fi copy didn't run: \(why)")
-            notify("Copy the Osmo clip", "\(why) Unplug the Pocket's USB-C, plug it back in and tap File Transfer instead.")
+            var t = take
+            t.importNote = "not copied: \(why)"
+            updateTake(t)
+            notify("Copy the Osmo clip", "\(why) Open OsmoSync and press Copy over Wi-Fi to try again.")
         }
         guard camera.state.isReady else { return usbFallback("The camera isn't connected over Bluetooth.") }
         guard let home = camera.wifiCredentials?() else { return usbFallback("OsmoSync doesn't have your Wi-Fi password.") }
@@ -376,7 +381,7 @@ final class AppModel: ObservableObject {
             notify("Osmo clip copied", "\(take.name) → \(destination.lastPathComponent)")
         } else {
             t.importNote = problem ?? "Wi-Fi copy failed"
-            notify("Copy the Osmo clip", "\(t.importNote ?? "") Unplug the Pocket's USB-C, plug it back in and tap File Transfer instead.")
+            notify("Copy the Osmo clip", "\(t.importNote ?? "") Open OsmoSync and press Copy over Wi-Fi to try again.")
         }
         camera.note("\(take.name): \(t.importNote ?? "")")
         updateTake(t)
