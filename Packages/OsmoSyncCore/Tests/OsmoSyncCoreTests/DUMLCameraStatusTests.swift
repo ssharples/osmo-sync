@@ -60,4 +60,31 @@ final class GimbalZoomTests: XCTestCase {
         XCTAssertEqual([f.cmdSet, f.cmdID], [0x02, 0xB8])
         XCTAssertEqual(f.payload, [0x0A, 0x4E, 0x8B, 0x02])
     }
+
+    func testTrackSubjectMatchesMimoLayout() {
+        let f = DUML.trackSubject(id: 0x2726, centreX: 0.5, centreY: 0.25, width: 1, height: 2, seq: 1)
+        XCTAssertEqual([f.cmdSet, f.cmdID], [0x02, 0xA6])
+        XCTAssertEqual(f.payload.count, 21)
+        XCTAssertEqual(Array(f.payload.prefix(5)), [0x01, 0x00, 0x00, 0x26, 0x27])
+        XCTAssertEqual(Array(f.payload[5..<9]), [0x00, 0x00, 0x00, 0x3F])    // 0.5
+        XCTAssertEqual(Array(f.payload[9..<13]), [0x00, 0x00, 0x80, 0x3E])   // 0.25
+        XCTAssertEqual(Array(f.payload[13..<17]), [0x00, 0x00, 0x80, 0x3F])  // 1
+        XCTAssertEqual(Array(f.payload[17..<21]), [0x00, 0x00, 0x00, 0x40])  // 2
+        XCTAssertEqual(DUML.stopTracking(seq: 1).payload, [UInt8](repeating: 0, count: 21))
+    }
+
+    func testTrackingReply() {
+        XCTAssertTrue(DUML.isTrackingLocked([0x00, 0x01, 0x00, 0x00]))
+        XCTAssertFalse(DUML.isTrackingLocked([0x00, 0x00, 0x00, 0x00]))
+        XCTAssertFalse(DUML.isTrackingLocked([0x00]))
+    }
+
+    func testFocusBurst() {
+        let b = DUML.focus(x: 0.5, y: 0.5, seq: 1)
+        XCTAssertEqual(b.map(\.cmdID), [0x22, 0x30, 0x68, 0x32])
+        XCTAssertEqual(b[1].payload.count, 21)
+        XCTAssertEqual(Array(b[1].payload[0..<4]), [0x00, 0x00, 0x00, 0x3F])
+        XCTAssertEqual(Array(b[3].payload[0..<4]), [0x00, 0x02, 0x01, 0x00])
+        XCTAssertEqual(b[3].payload.count, 20)
+    }
 }

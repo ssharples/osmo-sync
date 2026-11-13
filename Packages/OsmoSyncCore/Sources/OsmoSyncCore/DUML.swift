@@ -196,6 +196,50 @@ public enum DUML {
                      payload: [0x0A, 0x4E, UInt8(lens & 0xFF), UInt8(lens >> 8)])
     }
 
+    // MARK: Subject tracking and focus (from OpenCine's captures of DJI Mimo)
+
+    /// `0x02/0xA6`: track whatever is inside a box. `01 00 00`, a u16-LE request id, then the
+    /// box as four f32-LE values, 0…1 of the frame: centre x, centre y, width, height.
+    public static func trackSubject(id: UInt16, centreX: Float, centreY: Float, width: Float, height: Float,
+                                    seq: UInt16) -> Frame {
+        let p: [UInt8] = [0x01, 0x00, 0x00, UInt8(id & 0xFF), UInt8(id >> 8)]
+            + floatLE(centreX) + floatLE(centreY) + floatLE(width) + floatLE(height)
+        return Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0xA6, payload: p)
+    }
+
+    /// `0x02/0xA6` with 21 zero bytes: stop tracking.
+    public static func stopTracking(seq: UInt16) -> Frame {
+        Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0xA6,
+              payload: [UInt8](repeating: 0, count: 21))
+    }
+
+    /// `0x02/0xA5` `00`: is the camera tracking? Reply `00 01 00 00` locked, `00 00 00 00` idle.
+    public static func trackingState(seq: UInt16) -> Frame {
+        Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0xA5, payload: [0x00])
+    }
+
+    public static func isTrackingLocked(_ reply: [UInt8]) -> Bool {
+        reply.count >= 4 && reply[0] == 0 && reply[1] == 0x01
+    }
+
+    /// Mimo's tap-to-focus burst, in order: spot metering, focus point, AE hint, metering point.
+    /// `x` and `y` run 0…1 across the frame. The camera needs all four; two alone time out.
+    public static func focus(x: Float, y: Float, seq: UInt16) -> [Frame] {
+        [
+            Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0x22, payload: [0x02]),
+            Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0x30,
+                  payload: floatLE(x) + floatLE(y) + [UInt8](repeating: 0, count: 13)),
+            Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0x68, payload: [0x08]),
+            Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x02, cmdID: 0x32,
+                  payload: [0x00, 0x02, 0x01, 0x00] + floatLE(x) + floatLE(y) + [UInt8](repeating: 0, count: 8)),
+        ]
+    }
+
+    static func floatLE(_ v: Float) -> [UInt8] {
+        let b = v.bitPattern
+        return [UInt8(b & 0xFF), UInt8((b >> 8) & 0xFF), UInt8((b >> 16) & 0xFF), UInt8(b >> 24)]
+    }
+
     // MARK: Wi-Fi link registration
 
     /// `0x00/0x81` app device info, sent once after the UDP handshake.

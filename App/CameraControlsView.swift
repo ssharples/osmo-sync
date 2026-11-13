@@ -17,6 +17,18 @@ struct CameraControlsView: View {
             HStack {
                 Text("Aim").font(.subheadline.weight(.semibold))
                 Spacer()
+                if camera.trackingSubject {
+                    Button("Stop tracking") { camera.stopTracking() }
+                        .font(.caption)
+                }
+                Button {
+                    camera.findSubject()
+                } label: {
+                    Label(camera.findingSubject ? "Finding…" : "Find me", systemImage: "person.crop.square.badge.camera")
+                }
+                .font(.caption)
+                .disabled(camera.findingSubject || !camera.canControl)
+                .help("Points the camera ahead, locks tracking on whoever is in the middle, and focuses on them")
                 Button("Recentre") { camera.recentreGimbal() }
                     .font(.caption)
             }

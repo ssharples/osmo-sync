@@ -797,6 +797,54 @@ final class OsmoCamera: NSObject, ObservableObject {
         }
     }
 
+    @Published private(set) var findingSubject = false
+    @Published private(set) var trackingSubject = false
+    private var trackID: UInt16 = 1
+
+    /// "Find me": point the gimbal ahead, ask the camera to track whoever is in the middle of
+    /// the frame (its own ActiveTrack keeps them framed from then on), then focus on them.
+    /// The Mac has no picture from the camera, so this assumes you sit roughly in front of it.
+    func findSubject() {
+        guard let link = datalink, link.isOpen else { note("Can't find you: the camera isn't on Wi-Fi"); return }
+        guard !findingSubject else { return }
+        findingSubject = true
+        Task {
+            defer { findingSubject = false }
+            steer(pan: 0, tilt: 0)
+            _ = await link.request(DUML.stopTracking(seq: 0), timeout: 1)
+            let r = await link.request(DUML.gimbalRecentre(seq: 0), timeout: 2)
+            note("Find me: recentre " + (r.map { Self.hex($0.payload) } ?? "no reply"))
+            await pause(1.5)
+            // A head-and-shoulders box in the middle, a little above centre.
+            let id = trackID; trackID = trackID &+ 1 == 0 ? 1 : trackID &+ 1
+            let t = await link.request(DUML.trackSubject(id: id, centreX: 0.5, centreY: 0.42, width: 0.3, height: 0.45,
+                                                         seq: 0), timeout: 2)
+            note("Find me: track " + (t.map { Self.hex($0.payload) } ?? "no reply"))
+            var locked = false
+            for _ in 0..<10 {
+                await pause(0.4)
+                if let p = await link.request(DUML.trackingState(seq: 0), timeout: 1)?.payload, DUML.isTrackingLocked(p) {
+                    locked = true; break
+                }
+            }
+            trackingSubject = locked
+            for f in DUML.focus(x: 0.5, y: 0.42, seq: 0) {
+                let a = await link.request(f, timeout: 1)
+                if a?.payload.first != 0 { note(String(format: "Find me: focus %02X ", f.cmdID) + (a.map { Self.hex($0.payload) } ?? "no reply")) }
+            }
+            note(locked ? "Find me: tracking you and focused" : "Find me: focused, but the camera didn't lock on to anyone")
+        }
+    }
+
+    func stopTracking() {
+        trackingSubject = false
+        guard let link = datalink, link.isOpen else { return }
+        Task {
+            let r = await link.request(DUML.stopTracking(seq: 0), timeout: 2)
+            note("Stop tracking: " + (r.map { Self.hex($0.payload) } ?? "no reply"))
+        }
+    }
+
     private var busyRetries = 0
 
     /// The camera answers "busy" for a few seconds after waking or after another app let go.
