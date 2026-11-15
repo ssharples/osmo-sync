@@ -96,6 +96,18 @@ final class OsmoCamera: NSObject, ObservableObject {
     private var watchdog = WiFiWatchdog()
     private var watchdogTimer: Timer?
 
+    // Auto-connect: keeps a Bluetooth connection pending so the camera links up as soon as it
+    // powers on, and acts at once on a nudge (USB plug-in, Mac wake).
+    private var autoConnect = AutoConnect()
+    private var autoTimer: Timer?
+    /// You pressed Disconnect; only a nudge reconnects after that.
+    private var userStopped = false
+    private var connectingSince: Date?
+    /// While set, the next Pocket a scan finds is connected to (first-time setup by nudge).
+    private var autoPick = false
+    /// Called when the camera shows the approval prompt and needs a tap.
+    var onNeedsApproval: (() -> Void)?
+
     private let defaults = UserDefaults.standard
 
     /// The camera remembers a remote by device id and MAC, so keep both stable.
@@ -156,6 +168,55 @@ final class OsmoCamera: NSObject, ObservableObject {
     override init() {
         super.init()
         central = CBCentralManager(delegate: self, queue: .main)
+        autoTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.runAutoConnect(nudged: false) }
+        }
+    }
+
+    /// Something suggests the camera is on and close (plugged in, Mac woke, seen nearby):
+    /// connect over Bluetooth now, then put it on the home Wi-Fi.
+    func nudge(_ reason: String) {
+        note("\(reason): bringing the Pocket online")
+        userStopped = false
+        runAutoConnect(nudged: true)
+    }
+
+    private func runAutoConnect(nudged: Bool) {
+        guard central.state == .poweredOn else { return }
+        let link: AutoConnect.Link = switch state {
+        case .ready: .ready
+        case .waitingForApproval: .approving
+        case .connecting, .scanning: .connecting(since: connectingSince ?? Date())
+        case .failed: .failed
+        default: .off
+        }
+        let action = autoConnect.next(link: link, wifiHealthy: wifiLinkHealthy, wifiSetUp: wifiCredentials?() != nil,
+                                      nudged: nudged, userStopped: userStopped, now: Date())
+        switch action {
+        case .none: break
+        case .connect: connectSavedOrFind()
+        case .restart:
+            note("Bluetooth connection stuck; starting again")
+            wantConnection = false
+            if let p = peripheral { central.cancelPeripheralConnection(p) }
+            reset()
+            state = .idle
+            connectSavedOrFind()
+        case .rejoinWiFi:
+            Task { await reconnectWiFi(reason: "Camera not on Wi-Fi") }
+        }
+    }
+
+    /// Leaves a connection pending to the saved camera (it completes when the camera powers
+    /// on), or, with none saved, looks for a Pocket and connects to the first one found.
+    private func connectSavedOrFind() {
+        if let id = savedCameraID, let p = central.retrievePeripherals(withIdentifiers: [id]).first {
+            wantConnection = true
+            open(p)
+        } else if state != .scanning {
+            autoPick = true
+            scan()
+        }
     }
 
     // MARK: Public controls
@@ -175,6 +236,8 @@ final class OsmoCamera: NSObject, ObservableObject {
 
     func connect(to id: UUID) {
         central.stopScan()
+        userStopped = false
+        autoPick = false
         guard let p = peripherals[id] ?? central.retrievePeripherals(withIdentifiers: [id]).first else {
             state = .failed("That camera is no longer in range")
             return
@@ -195,6 +258,8 @@ final class OsmoCamera: NSObject, ObservableObject {
 
     func disconnect(forget: Bool = false) {
         wantConnection = false
+        userStopped = true
+        autoPick = false
         if let p = peripheral { central.cancelPeripheralConnection(p) }
         if forget { savedCameraID = nil }
         reset()
@@ -217,6 +282,7 @@ final class OsmoCamera: NSObject, ObservableObject {
         useDUML = Self.speaksDUML(p.name)
         p.delegate = self
         state = .connecting(p.name ?? "camera")
+        connectingSince = Date()
         central.connect(p)
         note("Connecting to \(p.name ?? p.identifier.uuidString)")
     }
@@ -463,7 +529,9 @@ final class OsmoCamera: NSObject, ObservableObject {
         case (0x07, 0x45) where f.isResponse:
             switch DUML.pairingReply(f.payload) {
             case .alreadyPaired: dumlReady()
-            case .needsApproval: note("Waiting for you to approve on the camera")
+            case .needsApproval:
+                note("Waiting for you to approve on the camera")
+                onNeedsApproval?()
             case .deferred: retryBusyPairing()
             case .other(let c): note("Pairing reply code \(c)")
             }
@@ -565,9 +633,23 @@ final class OsmoCamera: NSObject, ObservableObject {
 
     /// Lists clips over the Wi-Fi link: internal storage, then the microSD card if any.
     /// Returns paths without extension, newest first, each with the `/v2` storage id to try first.
-    func listClips() async -> [(path: String, storage: Int)] {
-        guard let link = datalink, link.isOpen else { return [] }
-        var out: [(String, Int)] = []
+    /// A clip on the camera. `handle` and `size` come from the media list; zero if it didn't say.
+    struct CameraClip: Equatable {
+        var path: String
+        var storage: Int
+        var handle: UInt32 = 0
+        var size: UInt32 = 0
+    }
+
+    /// The stores (1 internal, 0 card) whose list finished with an end-of-list chunk in the last
+    /// `listClips()`. Only a finished list proves a clip is missing from it. An empty card slot
+    /// sends a short "nothing here" chunk instead, and counts as not answered.
+    private(set) var lastListAnswered: Set<Int> = []
+
+    func listClips() async -> [CameraClip] {
+        guard let link = datalink, link.isOpen else { lastListAnswered = []; return [] }
+        var out: [CameraClip] = []
+        var answered: Set<Int> = []
         for (counter, cursor, storage) in [(UInt8(2), UInt32(0x4000_0001), 1), (UInt8(1), UInt32(1), 0)] {
             mediaChunks = []
             let reply = await link.request(DUML.mediaList(counter: counter, cursor: cursor, seq: 0), timeout: 2)
@@ -575,16 +657,66 @@ final class OsmoCamera: NSObject, ObservableObject {
             link.send(DUML.mediaListTrigger(seq: 0))
             // Wait for the end-of-list chunk (subtype 03), up to four seconds.
             for _ in 0..<20 where !mediaChunks.contains(where: { $0.count > 1 && $0[1] == 0x03 }) { await pause(0.2) }
-            let data = mediaChunks.filter { $0.count > 10 && $0[1] == 0x01 }.flatMap { $0.dropFirst(10) }
-            let paths = OsmoClips.paths(in: Array(data))
+            if mediaChunks.contains(where: { $0.count > 1 && $0[1] == 0x03 }) { answered.insert(storage) }
+            let data = Array(mediaChunks.filter { $0.count > 10 && $0[1] == 0x01 }.flatMap { $0.dropFirst(10) })
+            let paths = OsmoClips.paths(in: data)
+            let records = Dictionary(OsmoMedia.records(in: data).map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
             if paths.isEmpty {
                 note("Clip list reply \(reply.map { Self.hex($0.payload) } ?? "none"), \(mediaChunks.count) chunks: "
                      + mediaChunks.prefix(3).map { Self.hex(Array($0.prefix(24))) }.joined(separator: " | "))
             }
             note("Clip list (\(storage == 1 ? "internal" : "card")): \(paths.count) clip\(paths.count == 1 ? "" : "s")")
-            out += paths.map { ($0, storage) }
+            out += paths.map { CameraClip(path: $0, storage: storage, handle: records[$0]?.handle ?? 0, size: records[$0]?.size ?? 0) }
         }
+        lastListAnswered = answered
         return out
+    }
+
+    enum DeleteOutcome: Equatable {
+        case deleted
+        case kept(String)
+        /// The camera may or may not have deleted it; the re-list couldn't tell.
+        case unsure(String)
+    }
+
+    /// Deletes one clip from the camera, by the handle the camera lists for it right now.
+    /// Refuses unless the camera is idle and still lists `path` at `size` bytes (low 32 bits).
+    /// Never re-sends: the camera reuses file numbers, so a stale handle could hit another file.
+    func deleteClip(path: String, storage: Int, size: Int64) async -> DeleteOutcome {
+        guard !isRecording, freshStatus()?.isRecording != true else { return .kept("the camera is recording") }
+        // A long-open link stops answering some commands, so start a fresh one.
+        disconnectWiFi()
+        guard await findOnNetwork(within: 20), let link = datalink else { return .kept("the camera isn't on Wi-Fi") }
+        let before = await listClips()
+        guard lastListAnswered.contains(storage) else { return .kept("the camera didn't send its clip list") }
+        guard let clip = before.first(where: { $0.path == path && $0.storage == storage }) else {
+            return .kept("the camera no longer lists it")
+        }
+        guard clip.handle != 0 else { return .kept("the camera's list gave no file id") }
+        guard clip.size == UInt32(truncatingIfNeeded: size) else {
+            return .kept("the camera lists \(clip.size) bytes, the copy has \(size)")
+        }
+        guard Set(before.map(\.handle)).count == before.count else { return .kept("two clips share a file id") }
+
+        // The camera only answers deletes in playback; leave playback afterwards or it won't record.
+        _ = await link.request(DUML.playback(true, seq: 0), timeout: 2)
+        await pause(1.5)
+        note(String(format: "Deleting %@ (handle %08X, %lld bytes) from the camera", path, clip.handle, size))
+        let reply = await link.request(DUML.deleteFiles(handles: [clip.handle], seq: 0), timeout: 10, skipEmpty: true)
+        let status = reply.flatMap { DUML.deleteStatus($0.payload) }
+        note("Delete reply: \(status.map { String(format: "%04X", $0) } ?? "none")")
+        link.send(DUML.playback(false, seq: 0))
+        await pause(1.5)
+
+        let after = await listClips()
+        guard lastListAnswered.contains(storage) else { return .unsure("the camera didn't send its list after the delete") }
+        let others = Set(before.filter { $0.storage == storage }.map(\.path)).subtracting([path])
+        let lost = others.subtracting(after.map(\.path))
+        if !lost.isEmpty { note("WARNING: other clips also gone from the camera: \(lost.sorted().joined(separator: ", "))") }
+        if after.contains(where: { $0.path == path && $0.storage == storage }) {
+            return .kept("the camera still lists it (reply \(status.map { String(format: "%04X", $0) } ?? "none"))")
+        }
+        return .deleted
     }
 
     /// The camera's own hotspot name and password, read over Bluetooth. Never logged.
@@ -979,6 +1111,10 @@ extension OsmoCamera: CBCentralManagerDelegate {
                 found.append(Found(id: p.identifier, name: n.isEmpty ? "DJI device" : n, rssi: rssi.intValue))
                 note("Found \(n.isEmpty ? p.identifier.uuidString : n)")
             }
+            if autoPick, Self.speaksDUML(n) {
+                autoPick = false
+                connect(to: p.identifier)
+            }
         }
     }
 
@@ -1004,6 +1140,7 @@ extension OsmoCamera: CBCentralManagerDelegate {
                 peripheral = p
                 p.delegate = self
                 state = .connecting(p.name ?? "camera")
+                connectingSince = Date()
                 central.connect(p)
             }
         }

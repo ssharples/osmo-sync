@@ -167,6 +167,20 @@ enum CameraDownload {
         }
         let got = ((try? fm.attributesOfItem(atPath: part.path)[.size]) as? NSNumber)?.int64Value ?? 0
         guard got == size else { throw Failure.sizeMismatch(got, size) }
+        // Make sure every byte is on the disk before the file gets its real name, since the
+        // camera's copy may be deleted once this returns.
+        try fullSync(part)
         try fm.moveItem(at: part, to: dest)
+        try fullSync(dest.deletingLastPathComponent())
+    }
+
+    /// Flushes a file (or folder entry) all the way to the disk, not just the drive's cache.
+    static func fullSync(_ url: URL) throws {
+        let fd = open(url.path, O_RDONLY)
+        guard fd >= 0 else { throw Failure.gaveUp("couldn't open \(url.lastPathComponent) to flush it") }
+        defer { close(fd) }
+        if fcntl(fd, F_FULLFSYNC) != 0, fsync(fd) != 0 {
+            throw Failure.gaveUp("couldn't flush \(url.lastPathComponent) to disk")
+        }
     }
 }

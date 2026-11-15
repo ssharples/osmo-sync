@@ -166,6 +166,24 @@ public enum DUML {
         return Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x00, cmdID: 0x26, payload: p)
     }
 
+    /// `0x00/0x28` deletes files by media-list handle. Irreversible. The camera only answers
+    /// while in playback. Payload `[n][handle u32-LE × n][n u32] 00 [n u32] 01 01 00 00`,
+    /// from OpenCine / OsmoOffload (MIT).
+    public static func deleteFiles(handles: [UInt32], seq: UInt16) -> Frame {
+        let n = UInt32(handles.count)
+        func le(_ v: UInt32) -> [UInt8] { (0..<4).map { UInt8((v >> (8 * UInt32($0))) & 0xFF) } }
+        var p: [UInt8] = [UInt8(truncatingIfNeeded: n)]
+        for h in handles { p += le(h) }
+        p += le(n) + [0] + le(n) + [1, 1, 0, 0]
+        return Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x00, cmdID: 0x28, payload: p)
+    }
+
+    /// The status word in a delete reply: `0x0000` done, `0x00D6` no such file.
+    public static func deleteStatus(_ payload: [UInt8]) -> UInt16? {
+        guard let first = payload.first else { return nil }
+        return payload.count >= 2 ? UInt16(first) | UInt16(payload[1]) << 8 : UInt16(first)
+    }
+
     /// `0x00/0x26` stream trigger, sent between list queries.
     public static func mediaListTrigger(seq: UInt16) -> Frame {
         Frame(receiver: rxCamera, seq: seq, flags: flagRequest, cmdSet: 0x00, cmdID: 0x26,

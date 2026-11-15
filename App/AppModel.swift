@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Foundation
 import OsmoSyncCore
@@ -40,6 +41,26 @@ struct Take: Codable, Identifiable, Equatable {
     /// The lined-up copy of the first clip, and what happened when making it.
     var synced: String?
     var syncNote: String?
+    /// The camera files the copies came from, for deleting them afterwards. Optional so takes
+    /// saved by older versions still load.
+    var cameraFiles: [CameraFile]?
+    /// Set once every copied clip has been removed from the camera.
+    var removedFromCamera: Bool?
+    /// Why a clip stayed on the camera, when it did.
+    var deleteNote: String?
+
+    struct CameraFile: Codable, Equatable {
+        /// The copy in Osmo Takes.
+        var local: String
+        /// `DCIM/…` path on the camera, without extension, and which store holds it.
+        var path: String
+        var storage: Int
+        /// Bytes the camera served, which the copy must match.
+        var size: Int64
+        /// Bytes and file id in the camera's media list when the copy was made.
+        var listedSize: UInt32
+        var handle: UInt32
+    }
 
     var isOpen: Bool { end == nil }
     var needsImport: Bool { end != nil && cameraStarted && imported.isEmpty }
@@ -52,6 +73,10 @@ final class AppModel: ObservableObject {
     @Published var autoRecord: Bool { didSet { defaults.set(autoRecord, forKey: "autoRecord") } }
     @Published var autoImport: Bool { didSet { defaults.set(autoImport, forKey: "autoImport") } }
     @Published var autoLineUp: Bool { didSet { defaults.set(autoLineUp, forKey: "autoLineUp") } }
+    /// Delete each clip from the Pocket once its copy on the Mac is checked.
+    @Published var autoDelete: Bool { didSet { defaults.set(autoDelete, forKey: "autoDelete") } }
+    /// What "Clean up camera" is doing, shown in the menu. Empty when idle.
+    @Published private(set) var cleanupStatus = ""
     @Published var projectsFolder: URL { didSet { defaults.set(projectsFolder.path, forKey: "projectsFolder"); restartWatcher() } }
     @Published var destination: URL { didSet { defaults.set(destination.path, forKey: "destination") } }
     @Published private(set) var takes: [Take] = []
@@ -60,18 +85,27 @@ final class AppModel: ObservableObject {
     /// What the Wi-Fi hotspot copy is doing, shown in the menu. Empty when idle.
     @Published private(set) var hotspotStatus = ""
     /// Home Wi-Fi the camera joins so the Mac can start and stop it. Password lives in the keychain.
-    @Published var wifiSSID: String { didSet { defaults.set(wifiSSID, forKey: "wifiSSID") } }
+    @Published var wifiSSID: String {
+        didSet { defaults.set(wifiSSID, forKey: "wifiSSID"); if oldValue != wifiSSID { wifiPassword = nil } }
+    }
 
     private let defaults = UserDefaults.standard
     private var tailer: ScreenStudioLogTailer?
     private var startTask: Task<Bool, Never>?
     private var timer: Timer?
+    private let usb = USBWatcher()
+    private var lastUSBNudge = Date.distantPast
+    /// Set by a nudge: say "Pocket ready" when it's up, or say what's wrong if it isn't soon.
+    private var announce: (reason: String, at: Date)?
+    private var readyTimer: Timer?
+    private var downSince: Date? = Date()
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
         autoRecord = defaults.object(forKey: "autoRecord") as? Bool ?? true
         autoImport = defaults.object(forKey: "autoImport") as? Bool ?? true
         autoLineUp = defaults.object(forKey: "autoLineUp") as? Bool ?? true
+        autoDelete = defaults.object(forKey: "autoDelete") as? Bool ?? true
         wifiSSID = defaults.string(forKey: "wifiSSID") ?? ""
         projectsFolder = URL(fileURLWithPath: defaults.string(forKey: "projectsFolder")
                              ?? home.appendingPathComponent("Screen Studio Projects").path)
@@ -83,9 +117,10 @@ final class AppModel: ObservableObject {
         }
         restartWatcher()
         camera.wifiCredentials = { [weak self] in
-            guard let self, !self.wifiSSID.isEmpty, let pw = WiFiKeychain.password(for: self.wifiSSID) else { return nil }
+            guard let self, !self.wifiSSID.isEmpty, let pw = self.wifiPassword else { return nil }
             return (self.wifiSSID, pw)
         }
+        loadWiFiPassword()
 
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didMountNotification, object: nil, queue: .main
@@ -94,6 +129,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.volumeMounted(url) }
         }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        startAutoConnect()
         if CommandLine.arguments.contains("--probe") { runProbe() }
         if CommandLine.arguments.contains("--line-up") {
             // Test hook: line up every copied take that hasn't been lined up yet.
@@ -116,6 +152,61 @@ final class AppModel: ObservableObject {
                 camera.note(String(format: "DROP TEST: back on Wi-Fi %@ after %.0fs", camera.wifiLinkHealthy ? "yes" : "no", Date().timeIntervalSince(started)))
             }
         }
+        if CommandLine.arguments.contains("--delete-test") {
+            // Test hook: record a few seconds on the camera, copy that clip over the hotspot,
+            // and let the checked delete remove it. Touches no other clip.
+            Task { @MainActor in
+                for _ in 0..<180 where !(camera.state.isReady && camera.wifiLinkOpen) { try? await Task.sleep(for: .seconds(0.5)) }
+                guard camera.state.isReady, camera.wifiLinkOpen else { camera.note("DELETE TEST: camera not ready"); return }
+                guard !screenStudioRecording, !camera.isRecording else { camera.note("DELETE TEST: a recording is running; not testing"); return }
+                // Retry earlier test clips that stayed on the camera before making a new one.
+                let earlier = takes.filter { $0.name.hasPrefix("OsmoSync delete test") && $0.removedFromCamera != true && $0.cameraFiles?.isEmpty == false }
+                if !earlier.isEmpty {
+                    camera.holdWiFi = true
+                    for t in earlier {
+                        await removeFromCamera(t)
+                        camera.note("DELETE TEST: retried \(t.name): \(takes.first { $0.id == t.id }?.deleteNote ?? "none")")
+                    }
+                    camera.holdWiFi = false
+                    let now = await camera.listClips()
+                    camera.note("DELETE TEST: camera lists \(now.count) clips; done")
+                    return
+                }
+                let start = Date()
+                guard await camera.startRecording() else { camera.note("DELETE TEST: camera didn't start"); return }
+                let started = Date()
+                try? await Task.sleep(for: .seconds(4))
+                await camera.stopRecording()
+                var t = Take(name: "OsmoSync delete test \(start.formatted(.iso8601.time(includingFractionalSeconds: false)))",
+                             start: start, end: Date(), cameraStarted: true)
+                t.cameraStartedAt = started
+                addTake(t)
+                try? await Task.sleep(for: .seconds(3))
+                let before = await camera.listClips().map(\.path)
+                camera.note("DELETE TEST: camera lists \(before.count) clips before")
+                await copyOverHotspot(t)
+                let after = takes.first { $0.id == t.id }
+                camera.note("DELETE TEST: copied \(after?.imported ?? []), note: \(after?.deleteNote ?? "none")")
+                let now = await camera.listClips().map(\.path)
+                let gone = Set(before).subtracting(now)
+                camera.note("DELETE TEST: camera lists \(now.count) clips after; gone: \(gone.sorted())")
+                for f in after?.imported ?? [] {
+                    let url = URL(fileURLWithPath: f)
+                    camera.note("DELETE TEST: Mac copy \(url.lastPathComponent) \(Self.fileSize(url) ?? -1) bytes, \(await Self.videoDuration(url) ?? -1)s")
+                }
+                camera.note("DELETE TEST: done")
+            }
+        }
+        if CommandLine.arguments.contains("--cleanup-dry-run") {
+            // Test hook: report what "Clean up camera" would remove. Deletes nothing.
+            Task { @MainActor in
+                for _ in 0..<180 where !(camera.state.isReady && camera.wifiLinkOpen) { try? await Task.sleep(for: .seconds(0.5)) }
+                camera.holdWiFi = true
+                let items = await cleanupCandidates()
+                camera.holdWiFi = false
+                camera.note("CLEANUP DRY RUN: \(items.count) clips, \(Self.sizeText(items.reduce(0) { $0 + $1.size }))")
+            }
+        }
         if CommandLine.arguments.contains("--copy-latest") {
             // Test hook: wait for the camera and its Wi-Fi link, then copy the newest waiting take.
             Task { @MainActor in
@@ -128,15 +219,102 @@ final class AppModel: ObservableObject {
         }
     }
 
-    var hasWiFiPassword: Bool { !wifiSSID.isEmpty && WiFiKeychain.password(for: wifiSSID) != nil }
+    // MARK: Auto-connect
+
+    private func startAutoConnect() {
+        usb.onPocket = { [weak self] name in self?.pocketPluggedIn(name) }
+        usb.start()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            // Give the Mac's Wi-Fi and Bluetooth a few seconds to come back first.
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(6))
+                self?.nudge("Mac woke", announceIfUp: false)
+            }
+        }
+        camera.onNeedsApproval = { [weak self] in
+            self?.notify("Tap OK on the Pocket", "The Pocket is asking to pair with OsmoSync. Tap OK on its screen.")
+        }
+        readyTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.watchReady() }
+        }
+    }
+
+    private func pocketPluggedIn(_ name: String) {
+        // Switching the Pocket's USB mode reconnects it; one nudge per plug-in is enough.
+        guard Date().timeIntervalSince(lastUSBNudge) > 30 else { return }
+        lastUSBNudge = Date()
+        camera.note("USB: \(name) plugged in")
+        nudge("Pocket plugged in", announceIfUp: true)
+    }
+
+    private func nudge(_ reason: String, announceIfUp: Bool) {
+        let wasUp = pocketUp
+        if !wasUp || announceIfUp { announce = (reason, Date()) }
+        camera.nudge(reason)
+        watchReady()
+    }
+
+    /// Bluetooth up and, when Wi-Fi is set up, the camera reachable over it.
+    private var pocketUp: Bool {
+        camera.state.isReady && (!hasWiFiPassword || camera.wifiLinkHealthy)
+    }
+
+    private func watchReady() {
+        let busy = !hotspotStatus.isEmpty || !cleanupStatus.isEmpty || camera.holdWiFi
+        if pocketUp {
+            // Coming back after a long gap (camera powered on nearby) counts as news too.
+            if announce == nil, !busy, let d = downSince, Date().timeIntervalSince(d) > 60 {
+                announce = ("Pocket turned on", Date())
+            }
+            downSince = nil
+            if let a = announce {
+                announce = nil
+                camera.note("Pocket ready (\(a.reason))")
+                notify("Pocket ready", hasWiFiPassword ? "Connected and on \(wifiSSID). Recording will follow Screen Studio."
+                                                         : "Connected over Bluetooth.")
+            }
+        } else {
+            if downSince == nil, !busy { downSince = Date() }
+            if let a = announce, Date().timeIntervalSince(a.at) > 120 {
+                announce = nil
+                camera.note("Pocket not ready 2 minutes after \(a.reason): \(camera.state.label)")
+                notify("Pocket not ready", "\(camera.state.label). Check it's on and close to the Mac.")
+            }
+        }
+    }
+
+    var hasWiFiPassword: Bool { !wifiSSID.isEmpty && wifiPassword != nil }
+
+    /// The home Wi-Fi password, read from the keychain once per launch. Reading it can make
+    /// macOS ask for permission (each new build counts as a new app), so read it away from
+    /// the main thread: the menu keeps working while the prompt waits for an answer.
+    private var wifiPassword: String?
+
+    private func loadWiFiPassword() {
+        let ssid = wifiSSID
+        guard !ssid.isEmpty else { return }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let pw = WiFiKeychain.password(for: ssid)
+            await MainActor.run {
+                guard let self, self.wifiSSID == ssid else { return }
+                self.wifiPassword = pw
+                if pw != nil { self.camera.nudge("Wi-Fi password loaded") }
+            }
+        }
+    }
 
     /// Saves the Wi-Fi details and moves the camera onto that network.
     func setUpWiFi(ssid: String, password: String) {
         let name = ssid.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return }
         wifiSSID = name
-        if !password.isEmpty { WiFiKeychain.save(password, for: name) }
-        guard let pw = WiFiKeychain.password(for: name) else { return }
+        if !password.isEmpty {
+            WiFiKeychain.save(password, for: name)
+            wifiPassword = password
+        }
+        guard let pw = wifiPassword else { loadWiFiPassword(); return }
         Task { await camera.joinWiFi(ssid: name, password: pw) }
     }
 
@@ -336,10 +514,13 @@ final class AppModel: ObservableObject {
         guard !clips.isEmpty else { return usbFallback("No clip on the camera matches this take.") }
         guard let login = await camera.hotspotLogin() else { return usbFallback("The camera didn't share its hotspot login.") }
 
+        // Moving the camera to its hotspot takes it off your network, so never during a take.
+        guard !screenStudioRecording, !camera.isRecording else { return usbFallback("A recording started.") }
         let wired = MacWiFi.wiredOnline
         let busy = wired ? "Copying clip…" : "Copying clip… internet paused"
         status(busy)
         var copied: [String] = []
+        var sources: [Take.CameraFile] = []
         var problem: String?
         if await camera.switchToHotspot() {
             var joined = false
@@ -375,6 +556,10 @@ final class AppModel: ObservableObject {
                         let secs = max(Date().timeIntervalSince(started), 0.1)
                         camera.note(String(format: "Copied %@ (%.0f MB in %.0fs, %.0f MB/s)", target.lastPathComponent, mb, secs, mb / secs))
                         copied.append(target.path)
+                        if storage == clip.storage {
+                            sources.append(Take.CameraFile(local: target.path, path: clip.path, storage: storage, size: size,
+                                                           listedSize: clip.size, handle: clip.handle))
+                        }
                     } catch {
                         problem = error.localizedDescription
                         break
@@ -402,6 +587,7 @@ final class AppModel: ObservableObject {
         var t = take
         if !copied.isEmpty {
             t.imported = copied
+            t.cameraFiles = sources
             t.importNote = "Copied \(copied.count) clip\(copied.count == 1 ? "" : "s") over Wi-Fi"
             notify("Osmo clip copied", "\(take.name) → \(destination.lastPathComponent)")
         } else {
@@ -410,8 +596,185 @@ final class AppModel: ObservableObject {
         }
         camera.note("\(take.name): \(t.importNote ?? "")")
         updateTake(t)
+        if !copied.isEmpty, autoDelete {
+            if camBack, let fresh = takes.first(where: { $0.id == take.id }) {
+                await removeFromCamera(fresh)
+            } else {
+                var k = t
+                k.deleteNote = "Kept on the camera: it didn't come back on Wi-Fi to delete"
+                updateTake(k)
+            }
+        }
         if !copied.isEmpty, autoLineUp, let fresh = takes.first(where: { $0.id == take.id }) { await lineUp(fresh) }
         if !online { notify("Check your internet", "OsmoSync put the Mac back on \(home.ssid) but couldn't reach the internet.") }
+    }
+
+    // MARK: Remove clips from the camera
+
+    /// Deletes a take's clips from the camera, one at a time, each only after its copy passes
+    /// every check. Anything in doubt stays on the camera.
+    func removeFromCamera(_ take: Take) async {
+        guard let files = take.cameraFiles, !files.isEmpty else { return }
+        var t = take
+        var removed = 0
+        var kept: [String] = []
+        let expected = take.end.map { $0.timeIntervalSince(take.cameraStartedAt ?? take.start) }
+        for f in files {
+            let name = (f.path as NSString).lastPathComponent
+            guard !screenStudioRecording, !camera.isRecording else { kept.append("a recording started"); break }
+            let local = URL(fileURLWithPath: f.local)
+            let size = Self.fileSize(local)
+            let duration = await Self.videoDuration(local)
+            let verdict = DeleteCheck.verdict(localSize: size, servedSize: f.size, listedSize: f.listedSize,
+                                              handle: f.handle, duration: duration, expectedDuration: expected)
+            if case .keep(let why) = verdict {
+                camera.note("Kept \(name) on the camera: \(why)")
+                kept.append(why)
+                continue
+            }
+            switch await camera.deleteClip(path: f.path, storage: f.storage, size: f.size) {
+            case .deleted:
+                removed += 1
+                camera.note("Removed \(name).MP4 (\(Self.sizeText(f.size))) from the camera")
+            case .kept(let why), .unsure(let why):
+                camera.note("Kept \(name) on the camera: \(why)")
+                kept.append(why)
+            }
+        }
+        if removed == files.count {
+            t.removedFromCamera = true
+            t.deleteNote = "Removed from camera"
+        } else {
+            t.removedFromCamera = false
+            t.deleteNote = "Kept on the camera: \(kept.first ?? "not checked")"
+        }
+        updateTake(t)
+    }
+
+    /// One camera clip that "Clean up camera" would delete.
+    struct CleanupItem {
+        var clip: OsmoCamera.CameraClip
+        var local: URL
+        var size: Int64
+    }
+
+    /// Finds camera clips that already have a checked copy in the save folder: same size to
+    /// the byte (the camera's list carries the low 32 bits), recorded during the take that
+    /// copied it, and readable as video of about the right length. Deletes nothing.
+    func cleanupCandidates() async -> [CleanupItem] {
+        if !camera.wifiLinkOpen { await camera.findOnNetwork(within: 15) }
+        let listed = await camera.listClips()
+        guard !camera.lastListAnswered.isEmpty else { camera.note("Clean up: the camera didn't send its clip list"); return [] }
+        var out: [CleanupItem] = []
+        var used = Set<String>()
+        for take in takes where !take.imported.isEmpty && take.removedFromCamera != true {
+            let window = OsmoClips.pick(listed.map(\.path), takeStart: take.start, takeEnd: take.end ?? take.start)
+            let expected = take.end.map { $0.timeIntervalSince(take.cameraStartedAt ?? take.start) }
+            for path in window {
+                guard let clip = listed.first(where: { $0.path == path }), clip.handle != 0, clip.size != 0,
+                      camera.lastListAnswered.contains(clip.storage),
+                      !used.contains(path) else { continue }
+                for file in take.imported where !used.contains(file) {
+                    let url = URL(fileURLWithPath: file)
+                    guard let size = Self.fileSize(url), UInt32(truncatingIfNeeded: size) == clip.size else { continue }
+                    let duration = await Self.videoDuration(url)
+                    let verdict = DeleteCheck.verdict(localSize: size, servedSize: size, listedSize: clip.size,
+                                                      handle: clip.handle, duration: duration, expectedDuration: expected)
+                    guard verdict == .safe else { continue }
+                    out.append(CleanupItem(clip: clip, local: url, size: size))
+                    used.insert(path); used.insert(file)
+                    break
+                }
+            }
+        }
+        let total = out.reduce(Int64(0)) { $0 + $1.size }
+        camera.note("Clean up would remove \(out.count) of \(listed.count) camera clip\(listed.count == 1 ? "" : "s"), \(Self.sizeText(total))")
+        for item in out { camera.note("  \(item.clip.path) = \(item.local.lastPathComponent)") }
+        return out
+    }
+
+    /// "Clean up camera…": shows what it would remove and asks before deleting anything.
+    func cleanUpCamera() {
+        guard cleanupStatus.isEmpty, hotspotStatus.isEmpty else { return }
+        guard camera.state.isReady else { camera.note("Clean up: connect the camera first"); return }
+        guard !screenStudioRecording, !camera.isRecording else { camera.note("Clean up: not while recording"); return }
+        cleanupStatus = "Checking the camera's clips…"
+        Task {
+            camera.holdWiFi = true
+            defer { camera.holdWiFi = false; cleanupStatus = "" }
+            let items = await cleanupCandidates()
+            let total = items.reduce(Int64(0)) { $0 + $1.size }
+            let alert = NSAlert()
+            NSApp.activate(ignoringOtherApps: true)
+            guard !items.isEmpty else {
+                alert.messageText = "Nothing to clean up"
+                alert.informativeText = "No clip on the camera has a checked copy in \(destination.lastPathComponent)."
+                alert.runModal()
+                return
+            }
+            alert.messageText = "Remove \(items.count) clip\(items.count == 1 ? "" : "s") from the camera?"
+            alert.informativeText = "This frees \(Self.sizeText(total)) on the Pocket. Each clip already has a checked copy in \(destination.lastPathComponent). Other clips stay on the camera. This can't be undone on the camera."
+            alert.addButton(withTitle: "Remove from camera")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { camera.note("Clean up cancelled"); return }
+            var removed = 0
+            var freed: Int64 = 0
+            for (i, item) in items.enumerated() {
+                guard !screenStudioRecording, !camera.isRecording else { camera.note("Clean up stopped: a recording started"); break }
+                cleanupStatus = "Removing clip \(i + 1) of \(items.count)…"
+                let name = (item.clip.path as NSString).lastPathComponent
+                if await camera.deleteClip(path: item.clip.path, storage: item.clip.storage, size: item.size) == .deleted {
+                    removed += 1; freed += item.size
+                    camera.note("Removed \(name).MP4 (\(Self.sizeText(item.size))) from the camera")
+                    markRemoved(local: item.local.path)
+                } else {
+                    camera.note("Kept \(name) on the camera")
+                }
+            }
+            camera.note("Clean up: removed \(removed) of \(items.count), freed \(Self.sizeText(freed))")
+            notify("Camera cleaned up", "Removed \(removed) clip\(removed == 1 ? "" : "s"), freed \(Self.sizeText(freed)).")
+        }
+    }
+
+    private func markRemoved(local: String) {
+        guard var t = takes.first(where: { $0.imported.contains(local) }) else { return }
+        t.removedFromCamera = true
+        t.deleteNote = "Removed from camera"
+        updateTake(t)
+    }
+
+    nonisolated static func fileSize(_ url: URL) -> Int64? {
+        guard let n = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber else { return nil }
+        return n.int64Value
+    }
+
+    nonisolated static func sizeText(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    /// Seconds of video in the file, read by ffprobe (which reads the whole index), or by
+    /// AVFoundation if ffprobe isn't installed. Nil if neither can read it.
+    nonisolated static func videoDuration(_ url: URL) async -> Double? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let probes = ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "\(home)/.local/homebrew/bin/ffprobe"]
+        if let probe = probes.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            let out: Double? = await Task.detached {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: probe)
+                p.arguments = ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", url.path]
+                let pipe = Pipe()
+                p.standardOutput = pipe
+                p.standardError = FileHandle.nullDevice
+                guard (try? p.run()) != nil else { return nil }
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                guard p.terminationStatus == 0 else { return nil }
+                return Double(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+            }.value
+            return out
+        }
+        guard let d = try? await AVURLAsset(url: url).load(.duration), d.isNumeric else { return nil }
+        return d.seconds
     }
 
     /// Manual start/stop for testing without Screen Studio.
@@ -464,6 +827,9 @@ final class AppModel: ObservableObject {
         merged.cameraStartedAt = merged.cameraStartedAt ?? t.cameraStartedAt
         merged.synced = t.synced ?? merged.synced
         merged.syncNote = t.syncNote ?? merged.syncNote
+        merged.cameraFiles = t.cameraFiles ?? merged.cameraFiles
+        merged.removedFromCamera = t.removedFromCamera ?? merged.removedFromCamera
+        merged.deleteNote = t.deleteNote ?? merged.deleteNote
         takes[i] = merged
         saveTakes()
     }

@@ -36,7 +36,7 @@ final class OsmoDatalink {
     private var extraCursor: UInt16?
     private var ackTimer: Timer?
     private var presenceTimer: Timer?
-    private var waiters: [(set: UInt8, id: UInt8, c: CheckedContinuation<DUML.Frame?, Never>)] = []
+    private var waiters: [(set: UInt8, id: UInt8, skipEmpty: Bool, c: CheckedContinuation<DUML.Frame?, Never>)] = []
     private(set) var isOpen = false
     private(set) var lastHeard = Date.distantPast
     var trace = false
@@ -92,11 +92,12 @@ final class OsmoDatalink {
         waiters = []
     }
 
-    /// Sends a frame and waits for the camera's reply to the same command.
-    func request(_ frame: DUML.Frame, timeout: Double) async -> DUML.Frame? {
+    /// Sends a frame and waits for the camera's reply to the same command. With `skipEmpty`,
+    /// an empty reply (some commands get a bare acknowledgment first) doesn't count.
+    func request(_ frame: DUML.Frame, timeout: Double, skipEmpty: Bool = false) async -> DUML.Frame? {
         guard udp != nil else { return nil }
         return await withCheckedContinuation { c in
-            waiters.append((frame.cmdSet, frame.cmdID, c))
+            waiters.append((frame.cmdSet, frame.cmdID, skipEmpty, c))
             send(frame)
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(timeout))
@@ -200,7 +201,7 @@ final class OsmoDatalink {
             if trace, !(f.cmdSet == 0 && (f.cmdID == 0x88 || f.cmdID == 0x81)) {
                 log(String(format: "WiFi RX %02X/%02X: ", f.cmdSet, f.cmdID) + OsmoCamera.hex(f.payload))
             }
-            if let i = waiters.firstIndex(where: { $0.set == f.cmdSet && $0.id == f.cmdID }) {
+            if let i = waiters.firstIndex(where: { $0.set == f.cmdSet && $0.id == f.cmdID && !($0.skipEmpty && f.payload.isEmpty) }) {
                 waiters.remove(at: i).c.resume(returning: f)
             }
         }

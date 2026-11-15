@@ -1,6 +1,10 @@
 APP := build/dd/Build/Products/Release/OsmoSync.app
 AGENT := com.ssharples.OsmoSync
 AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT).plist
+# Sign with your Apple Development certificate when there is one. A steady signature means
+# macOS treats each new build as the same app, so the keychain stops asking about the Wi-Fi
+# password after every update. Falls back to ad-hoc signing.
+SIGN_ID ?= $(shell security find-identity -v -p codesigning 2>/dev/null | awk '/"Apple Development/ {print $$2; exit}')
 
 .PHONY: test app run install uninstall clean
 
@@ -21,7 +25,7 @@ install: app
 	-pkill -x OsmoSync; sleep 1
 	rm -rf /Applications/OsmoSync.app
 	cp -R "$(APP)" /Applications/
-	codesign --force --deep --sign - /Applications/OsmoSync.app
+	codesign --force --deep --sign "$(or $(SIGN_ID),-)" /Applications/OsmoSync.app
 	mkdir -p "$(HOME)/Library/LaunchAgents"
 	cp Support/$(AGENT).plist "$(AGENT_PLIST)"
 	launchctl bootstrap gui/$$(id -u) "$(AGENT_PLIST)"

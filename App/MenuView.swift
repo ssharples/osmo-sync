@@ -138,6 +138,8 @@ struct MenuView: View {
             Toggle("Record on the Osmo when Screen Studio records", isOn: $model.autoRecord)
             Toggle("Copy clips to the Mac when the camera's card mounts", isOn: $model.autoImport)
             Toggle("Line up clips with the Screen Studio recording", isOn: $model.autoLineUp)
+            Toggle("Delete clips from the Pocket after copying", isOn: $model.autoDelete)
+                .help("Only after the copy on the Mac is checked: same size, fully written, and plays as video.")
             HStack {
                 Text("Save to").foregroundStyle(.secondary)
                 Button(model.destination.lastPathComponent) { model.choose(folderFor: \.destination) }
@@ -171,6 +173,14 @@ struct MenuView: View {
                         .font(.caption)
                 }
             }
+            if !model.cleanupStatus.isEmpty {
+                Label(model.cleanupStatus, systemImage: "trash").font(.caption).foregroundStyle(.blue)
+            } else if camera.state.isReady && camera.wifiLinkOpen {
+                Button("Clean up camera…") { model.cleanUpCamera() }
+                    .font(.caption)
+                    .disabled(model.screenStudioRecording || camera.isRecording || !model.hotspotStatus.isEmpty)
+                    .help("Removes clips from the Pocket that already have a checked copy on this Mac. Asks first.")
+            }
             if model.takes.isEmpty {
                 Text("Start a recording in Screen Studio and the Osmo starts with it.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -179,6 +189,9 @@ struct MenuView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(t.name).font(.caption).lineLimit(1)
                     Text(takeLine(t)).font(.caption2).foregroundStyle(.secondary)
+                    if let d = t.deleteNote {
+                        Text(d).font(.caption2).foregroundStyle(t.removedFromCamera == true ? .green : .secondary)
+                    }
                     if let s = t.syncNote {
                         Text(s).font(.caption2).foregroundStyle(s.hasPrefix("Synced") ? .green : .secondary)
                     }
