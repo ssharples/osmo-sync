@@ -202,6 +202,26 @@ final class AppModel: ObservableObject {
                 camera.note("DELETE TEST: done")
             }
         }
+        if CommandLine.arguments.contains("--rest-test") {
+            // Test hook: wait for the camera to rest, let one network check pass, then time how
+            // long the Wi-Fi link takes to come back (what a recording start would wait for).
+            Task { @MainActor in
+                for _ in 0..<600 where !camera.resting { try? await Task.sleep(for: .seconds(1)) }
+                guard camera.resting else { camera.note("REST TEST: never rested"); return }
+                try? await Task.sleep(for: .seconds(75))
+                camera.note("REST TEST: still resting \(camera.resting); waking")
+                for i in 1...3 {
+                    let t = Date()
+                    let ok = await camera.wake("rest test \(i)")
+                    camera.note(String(format: "REST TEST: wake %d %@ in %.2fs", i, ok ? "ok" : "failed", Date().timeIntervalSince(t)))
+                    if i < 3 {
+                        camera.disconnectWiFi()
+                        camera.markRestingForTest()
+                    }
+                }
+                camera.note("REST TEST: done")
+            }
+        }
         if CommandLine.arguments.contains("--big-copy-test") {
             // Test hook: record a clip over 2 GB, copy it over the hotspot, and turn the Mac's
             // Wi-Fi off for a few seconds partway through so the copy has to rejoin and resume.
@@ -310,7 +330,7 @@ final class AppModel: ObservableObject {
 
     /// Bluetooth up and, when Wi-Fi is set up, the camera reachable over it.
     private var pocketUp: Bool {
-        camera.state.isReady && (!hasWiFiPassword || camera.wifiLinkHealthy)
+        camera.state.isReady && (!hasWiFiPassword || camera.wifiReady)
     }
 
     private func watchReady() {
@@ -476,7 +496,7 @@ final class AppModel: ObservableObject {
         guard autoRecord else { addTake(take); return }
         addTake(take)
         // Say so at once if the camera can't be reached, rather than after the take.
-        let reachable = camera.state.isReady && camera.wifiLinkHealthy
+        let reachable = camera.state.isReady && camera.wifiReady
         if !reachable { notify(Self.unreachableTitle, Self.unreachableBody) }
         startTask = Task {
             let ok = await camera.startRecording()

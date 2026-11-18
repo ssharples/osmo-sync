@@ -11,6 +11,8 @@ struct MenuView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+                .onAppear { camera.menuOpen = true }
+                .onDisappear { camera.menuOpen = false }
             Divider()
             cameraSection
             if camera.state.isReady {

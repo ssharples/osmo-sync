@@ -190,7 +190,7 @@ final class OsmoCamera: NSObject, ObservableObject {
         case .failed: .failed
         default: .off
         }
-        let action = autoConnect.next(link: link, wifiHealthy: wifiLinkHealthy, wifiSetUp: wifiCredentials?() != nil,
+        let action = autoConnect.next(link: link, wifiHealthy: wifiReady, wifiSetUp: wifiCredentials?() != nil,
                                       nudged: nudged, userStopped: userStopped, now: Date())
         switch action {
         case .none: break
@@ -485,6 +485,65 @@ final class OsmoCamera: NSObject, ObservableObject {
         }
     }
 
+    // MARK: Resting between takes
+
+    /// True while OsmoSync has closed its Wi-Fi link so the camera can idle. The camera stays
+    /// on your Wi-Fi; the link reopens (about a second) when a recording starts.
+    @Published private(set) var resting = false
+    /// The menu is showing, so Aim may be used any moment: stay awake.
+    var menuOpen = false { didSet { if menuOpen { touch("menu opened") } } }
+    private var lastActivity = Date()
+    private var restCheckAt = Date.distantPast
+    private var restMisses = 0
+    private let rest = CameraRest()
+
+    /// Reachable over Wi-Fi, or resting with the link closed on purpose.
+    var wifiReady: Bool { resting || wifiLinkHealthy }
+
+    /// Marks activity, and reopens the link if resting.
+    func touch(_ why: String) {
+        lastActivity = Date()
+        if resting { Task { await wake(why) } }
+    }
+
+    @discardableResult
+    func wake(_ why: String) async -> Bool {
+        lastActivity = Date()
+        guard resting, !reconnecting, !wifiBusy else { return wifiLinkOpen }
+        let started = Date()
+        let ok = await findOnNetwork(within: 6)
+        resting = false
+        note(String(format: "Awake (%@): Wi-Fi link %@ in %.1fs", why, ok ? "open" : "didn't open", Date().timeIntervalSince(started)))
+        if !ok { watchdog.reset() }  // the watchdog takes it from here
+        return ok
+    }
+
+    /// Test hook only.
+    func markRestingForTest() { resting = true }
+
+    private func startResting() {
+        datalink?.close(); datalink = nil
+        resting = true
+        restMisses = 0
+        restCheckAt = Date()
+        note("Resting: Wi-Fi link closed so the camera can idle. It reopens when a recording starts.")
+    }
+
+    /// While resting: one quick check a minute that the camera is still on the network.
+    private func checkWhileResting() {
+        guard rest.checkDue(now: Date(), lastCheck: restCheckAt) else { return }
+        restCheckAt = Date()
+        guard let host = lastHost else { Task { await wake("no address to check") }; return }
+        Task {
+            if await OsmoLANScan.probe(host) {
+                restMisses = 0
+            } else {
+                restMisses += 1
+                if rest.shouldWake(misses: restMisses) { await wake("camera stopped answering") }
+            }
+        }
+    }
+
     /// The Wi-Fi link counts as alive while it's open and the camera spoke recently.
     var wifiLinkHealthy: Bool {
         guard let link = datalink, link.isOpen else { return false }
@@ -495,6 +554,17 @@ final class OsmoCamera: NSObject, ObservableObject {
     /// Wi-Fi (power-off, sleep, a router blip), it puts it back without anyone pressing a button.
     private func watchWiFi() {
         guard useDUML, wifiCredentials?() != nil else { return }
+        if resting {
+            if holdWiFi || wifiBusy || menuOpen { Task { await wake("needed") } } else { checkWhileResting() }
+            return
+        }
+        let busy = holdWiFi || wifiBusy || reconnecting || isRecording || dumlRecording || menuOpen
+            || trackingSubject || findingSubject || stickTimer != nil
+        if busy { lastActivity = Date() }
+        if state.isReady, rest.shouldRest(now: Date(), lastActivity: lastActivity, busy: busy, linkHealthy: wifiLinkHealthy) {
+            startResting()
+            return
+        }
         let action = watchdog.check(now: Date(), bleReady: state.isReady, linkHealthy: wifiLinkHealthy,
                                     held: holdWiFi || wifiBusy || reconnecting)
         if action == .rejoin { Task { await reconnectWiFi(reason: "Wi-Fi link down for a while") } }
@@ -559,9 +629,14 @@ final class OsmoCamera: NSObject, ObservableObject {
 
     private func sendDUMLRecord(start: Bool) async -> Bool {
         // Over Bluetooth the Pocket ignores record commands; they only work on its Wi-Fi link.
+        lastActivity = Date()
         if !wifiLinkOpen || Date().timeIntervalSince(datalink?.lastHeard ?? .distantPast) > 5 {
+            let wasResting = resting
+            let t = Date()
             datalink?.close(); datalink = nil
             if wifiIdentity != nil { _ = await findOnNetwork(within: 8) }
+            note(String(format: "Wi-Fi link %@ %.1fs before the record command%@", wifiLinkOpen ? "reopened" : "not open",
+                        Date().timeIntervalSince(t), wasResting ? " (was resting)" : ""))
         }
         guard let link = datalink, link.isOpen else {
             note("Can't \(start ? "start" : "stop") recording: the camera isn't on Wi-Fi")
@@ -917,10 +992,15 @@ final class OsmoCamera: NSObject, ObservableObject {
                     if self.trace, st.isRecording != self.wifiCamStatus?.isRecording || st.inPlayback != self.wifiCamStatus?.inPlayback {
                         self.note("Camera status: recording \(st.isRecording), playback \(st.inPlayback)")
                     }
+                    if st.hot != (self.wifiCamStatus?.hot ?? false) {
+                        self.note(String(format: "Camera heat flag %@ (status flags %08X)", st.hot ? "ON" : "off", st.flags))
+                    }
                     self.wifiCamStatus = st
                     self.wifiCamStatusAt = Date()
                 }
                 lastHost = host
+                resting = false
+                lastActivity = Date()
                 wifiStatus = "Camera on Wi-Fi at \(host)"
                 note(wifiStatus)
                 return true

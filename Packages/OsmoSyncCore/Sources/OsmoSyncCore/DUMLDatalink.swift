@@ -166,6 +166,11 @@ public enum DUMLStation {
 public struct DUMLCameraStatus: Equatable {
     public var isRecording: Bool
     public var inPlayback: Bool
+    /// The raw first four bytes, little-endian.
+    public var flags: UInt32
+    /// Bit 17, "hot state" in DJI's camera status layout for older cameras. Not yet
+    /// confirmed on a Pocket 4P; logged when it changes so it can be checked.
+    public var hot: Bool { flags & 0x2_0000 != 0 }
     /// Seconds into the current clip (0 when idle), when the push carries it.
     public var elapsed: Int?
 
@@ -173,6 +178,7 @@ public struct DUMLCameraStatus: Equatable {
         guard f.cmdSet == 0x02, f.cmdID == 0x80, f.payload.count >= 13 else { return nil }
         let p = f.payload
         let flags = UInt32(p[0]) | UInt32(p[1]) << 8 | UInt32(p[2]) << 16 | UInt32(p[3]) << 24
+        self.flags = flags
         isRecording = flags & 0x80 != 0
         inPlayback = flags & 0x4000_0000 != 0
         elapsed = p.count >= 31 ? Int(p[29]) | Int(p[30]) << 8 : nil
