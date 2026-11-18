@@ -474,7 +474,8 @@ final class OsmoCamera: NSObject, ObservableObject {
         if let p = peripheral { pairedCameras.insert(p.identifier.uuidString) }
         state = .ready(name)
         note("Connected to \(name)")
-        if !wifiLinkOpen, let creds = wifiCredentials?() {
+        // During a copy the camera is meant to be on its own hotspot; the copy puts it back.
+        if !wifiLinkOpen, !holdWiFi, let creds = wifiCredentials?() {
             Task { await joinWiFi(ssid: creds.ssid, password: creds.password) }
         }
         watchdog.reset()
@@ -740,13 +741,28 @@ final class OsmoCamera: NSObject, ObservableObject {
         for _ in 0..<10 {
             await pause(1)
             let role = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 6)?.payload ?? []
-            // A Pocket 4P reads back `00 08` on its hotspot rather than `00 00`; anything but
-            // "station" means it has left your Wi-Fi.
-            if !role.isEmpty, DUMLStation.role(role) != .station { note("Camera is on its own hotspot (\(Self.hex(role)))"); return true }
+            // `00 FF` means the radio is off (a hotspot that shut down), not a hotspot.
+            if DUMLStation.role(role) == .accessPoint { note("Camera is on its own hotspot (\(Self.hex(role)))"); return true }
+            if !role.isEmpty { note("Camera Wi-Fi role while switching: \(Self.hex(role))") }
         }
         // The readback isn't always clear; the Mac's join decides.
         note("Camera hotspot role unconfirmed; trying to join anyway")
         return r != nil
+    }
+
+    /// Brings a hotspot that shut down back up: back to station mode, then hotspot again.
+    /// Sending "hotspot" alone to a camera whose hotspot died leaves its radio off (`00 FF`).
+    func restartHotspot() async -> Bool {
+        guard useDUML, state.isReady else { return false }
+        let r = await bleRequest(DUML.stationMode(true, seq: nextDUMLSeq()), timeout: 12)?.payload
+        note("Hotspot restart, station switch reply: \(r.map { Self.hex($0) } ?? "none")")
+        for _ in 0..<10 {
+            await pause(1)
+            let role = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 6)?.payload ?? []
+            if DUMLStation.role(role) == .station { break }
+        }
+        await pause(2)
+        return await switchToHotspot()
     }
 
     private func freshStatus() -> DUMLCameraStatus? {
@@ -825,7 +841,7 @@ final class OsmoCamera: NSObject, ObservableObject {
             }
             // An unrecognised readback isn't proof of failure; the join reply and the
             // identity check on the LAN decide.
-            if !switched, role == .accessPoint {
+            if !switched, roleReply == [0, 0] {
                 wifiStatus = "Camera Wi-Fi is still starting. Try again."
                 note(wifiStatus)
                 return false

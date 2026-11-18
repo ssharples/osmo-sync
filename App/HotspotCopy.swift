@@ -130,18 +130,40 @@ enum CameraDownload {
         return nil
     }
 
+    /// What the caller should know about a failed piece before the next try.
+    struct Hiccup {
+        var attempt: Int
+        var offset: Int64
+        var error: Error
+        var wait: TimeInterval
+    }
+
+    /// Downloads `path` into `<dest>.part`, resuming from whatever is there, then renames it.
+    ///
+    /// On a failed piece it calls `recover` (which can get the Mac back on the hotspot),
+    /// waits with backoff and carries on from the last byte saved. `recover` returns false
+    /// to stop; the `.part` file stays so a later copy resumes from it.
     static func fetch(_ path: String, storage: Int, size: Int64, to dest: URL,
-                      progress: @escaping (Int64) -> Void) async throws {
+                      policy: CopyRetry = CopyRetry(),
+                      progress: @escaping (Int64) -> Void,
+                      shouldStop: () async -> Bool = { false },
+                      recover: (Hiccup) async -> Bool = { _ in true }) async throws {
         let fm = FileManager.default
         let part = dest.appendingPathExtension("part")
-        if !fm.fileExists(atPath: part.path) { fm.createFile(atPath: part.path, contents: nil) }
-        var pos = ((try? fm.attributesOfItem(atPath: part.path)[.size]) as? NSNumber)?.int64Value ?? 0
-        if pos > size { try fm.removeItem(at: part); fm.createFile(atPath: part.path, contents: nil); pos = 0 }
-        let chunk: Int64 = 64 << 20
-        var failures = 0
-        while pos < size {
+        let existing = ((try? fm.attributesOfItem(atPath: part.path)[.size]) as? NSNumber)?.int64Value
+        var pos = CopyRange.resumePoint(partSize: existing, size: size)
+        if pos == 0 || !fm.fileExists(atPath: part.path) {
+            try? fm.removeItem(at: part)
+            fm.createFile(atPath: part.path, contents: nil)
+        }
+        progress(pos)
+        // Small enough that a cut-off piece wastes little; big enough to keep the link busy.
+        let chunk: Int64 = 32 << 20
+        var attempt = 0
+        while let range = CopyRange.header(from: pos, size: size, chunk: chunk) {
+            if await shouldStop() { throw CancellationError() }
             var req = URLRequest(url: OsmoClips.url(path: path, storage: storage))
-            req.setValue("bytes=\(pos)-\(min(pos + chunk, size) - 1)", forHTTPHeaderField: "Range")
+            req.setValue(range, forHTTPHeaderField: "Range")
             do {
                 let (tmp, r) = try await session.download(for: req)
                 defer { try? fm.removeItem(at: tmp) }
@@ -153,16 +175,26 @@ enum CameraDownload {
                 let piece = h.statusCode == 200 ? data.prefix(Int(min(chunk, size))) : data
                 guard !piece.isEmpty else { throw Failure.gaveUp("empty reply at \(pos)") }
                 let out = try FileHandle(forWritingTo: part)
-                try out.seekToEnd()
+                try out.seek(toOffset: UInt64(pos))
                 try out.write(contentsOf: piece)
+                try out.truncate(atOffset: UInt64(pos) + UInt64(piece.count))
                 try out.close()
                 pos += Int64(piece.count)
-                failures = 0
+                attempt = 0
                 progress(pos)
             } catch {
-                failures += 1
-                if failures > 6 { throw Failure.gaveUp(error.localizedDescription) }
-                try? await Task.sleep(for: .seconds(min(2.0 * Double(failures), 8)))
+                attempt += 1
+                guard policy.shouldRetry(attempt: attempt) else {
+                    throw Failure.gaveUp("\(error.localizedDescription) (\(policy.maxAttempts) tries at byte \(pos))")
+                }
+                let hiccup = Hiccup(attempt: attempt, offset: pos, error: error, wait: policy.delay(attempt: attempt))
+                guard await recover(hiccup) else { throw CancellationError() }
+                // Wait in short steps so a recording starting mid-wait ends the copy at once.
+                let until = Date().addingTimeInterval(hiccup.wait)
+                while Date() < until {
+                    if await shouldStop() { throw CancellationError() }
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
             }
         }
         let got = ((try? fm.attributesOfItem(atPath: part.path)[.size]) as? NSNumber)?.int64Value ?? 0

@@ -113,7 +113,8 @@ struct MenuView: View {
                         password = ""
                         editingWiFi = false
                     }
-                    .disabled(ssid.trimmingCharacters(in: .whitespaces).isEmpty || !camera.state.isReady || camera.wifiBusy)
+                    .disabled(ssid.trimmingCharacters(in: .whitespaces).isEmpty || !camera.state.isReady || camera.wifiBusy
+                               || model.copyingTake != nil)
                     if editingWiFi { Button("Cancel") { editingWiFi = false } }
                 }
                 if !camera.state.isReady {
@@ -123,7 +124,7 @@ struct MenuView: View {
                 HStack {
                     Text(model.wifiSSID).font(.callout)
                     Spacer()
-                    if !camera.wifiLinkOpen {
+                    if !camera.wifiLinkOpen && model.copyingTake == nil {
                         Button("Retry") { model.setUpWiFi(ssid: model.wifiSSID, password: "") }
                             .disabled(!camera.state.isReady || camera.wifiBusy || !model.hasWiFiPassword)
                     }
@@ -189,6 +190,10 @@ struct MenuView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(t.name).font(.caption).lineLimit(1)
                     Text(takeLine(t)).font(.caption2).foregroundStyle(.secondary)
+                    if t.id == model.copyingTake, !model.copyProgress.isEmpty {
+                        Text(model.copyProgress).font(.caption2)
+                            .foregroundStyle(model.copyProgress.hasPrefix("Retrying") ? .orange : .blue)
+                    }
                     if let d = t.deleteNote {
                         Text(d).font(.caption2).foregroundStyle(t.removedFromCamera == true ? .green : .secondary)
                     }

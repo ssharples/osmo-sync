@@ -84,6 +84,11 @@ final class AppModel: ObservableObject {
     @Published private(set) var importing = false
     /// What the Wi-Fi hotspot copy is doing, shown in the menu. Empty when idle.
     @Published private(set) var hotspotStatus = ""
+    /// The take a Wi-Fi copy is working on, and its progress line for that take's row.
+    @Published private(set) var copyingTake: UUID?
+    @Published private(set) var copyProgress = ""
+    /// Test hook only: turn the Mac's Wi-Fi off briefly once a copy passes this percentage.
+    private var dropWiFiAt: Int?
     /// Home Wi-Fi the camera joins so the Mac can start and stop it. Password lives in the keychain.
     @Published var wifiSSID: String {
         didSet { defaults.set(wifiSSID, forKey: "wifiSSID"); if oldValue != wifiSSID { wifiPassword = nil } }
@@ -195,6 +200,53 @@ final class AppModel: ObservableObject {
                     camera.note("DELETE TEST: Mac copy \(url.lastPathComponent) \(Self.fileSize(url) ?? -1) bytes, \(await Self.videoDuration(url) ?? -1)s")
                 }
                 camera.note("DELETE TEST: done")
+            }
+        }
+        if CommandLine.arguments.contains("--big-copy-test") {
+            // Test hook: record a clip over 2 GB, copy it over the hotspot, and turn the Mac's
+            // Wi-Fi off for a few seconds partway through so the copy has to rejoin and resume.
+            // Stops the camera at once if Screen Studio starts. Touches no other clip.
+            Task { @MainActor in
+                for _ in 0..<180 where !(camera.state.isReady && camera.wifiLinkOpen) { try? await Task.sleep(for: .seconds(0.5)) }
+                guard camera.state.isReady, camera.wifiLinkOpen else { camera.note("BIG COPY TEST: camera not ready"); return }
+                guard !screenStudioRecording, !camera.isRecording else { camera.note("BIG COPY TEST: a recording is running; not testing"); return }
+                if let earlier = takes.first(where: { $0.name.hasPrefix("OsmoSync big copy test") && $0.imported.isEmpty }) {
+                    // Reuse the test clip already on the camera rather than record another.
+                    camera.note("BIG COPY TEST: copying \(earlier.name) again")
+                    dropWiFiAt = 35
+                    await copyOverHotspot(earlier)
+                    dropWiFiAt = nil
+                    let after = takes.first { $0.id == earlier.id }
+                    camera.note("BIG COPY TEST: copied \(after?.imported ?? []), note: \(after?.importNote ?? "none"); \(after?.deleteNote ?? "")")
+                    for f in after?.imported ?? [] {
+                        let url = URL(fileURLWithPath: f)
+                        camera.note("BIG COPY TEST: Mac copy \(url.lastPathComponent) \(Self.fileSize(url) ?? -1) bytes, \(await Self.videoDuration(url) ?? -1)s")
+                    }
+                    camera.note("BIG COPY TEST: done")
+                    return
+                }
+                let start = Date()
+                guard await camera.startRecording() else { camera.note("BIG COPY TEST: camera didn't start"); return }
+                let started = Date()
+                camera.note("BIG COPY TEST: recording ~4 minutes")
+                while Date().timeIntervalSince(started) < 240, !screenStudioRecording { try? await Task.sleep(for: .seconds(1)) }
+                await camera.stopRecording()
+                guard !screenStudioRecording else { camera.note("BIG COPY TEST: Screen Studio started; stopped the test"); return }
+                var t = Take(name: "OsmoSync big copy test \(start.formatted(.iso8601.time(includingFractionalSeconds: false)))",
+                             start: start, end: Date(), cameraStarted: true)
+                t.cameraStartedAt = started
+                addTake(t)
+                try? await Task.sleep(for: .seconds(3))
+                dropWiFiAt = 35
+                await copyOverHotspot(t)
+                dropWiFiAt = nil
+                let after = takes.first { $0.id == t.id }
+                camera.note("BIG COPY TEST: copied \(after?.imported ?? []), note: \(after?.importNote ?? "none"); \(after?.deleteNote ?? "")")
+                for f in after?.imported ?? [] {
+                    let url = URL(fileURLWithPath: f)
+                    camera.note("BIG COPY TEST: Mac copy \(url.lastPathComponent) \(Self.fileSize(url) ?? -1) bytes, \(await Self.videoDuration(url) ?? -1)s")
+                }
+                camera.note("BIG COPY TEST: done")
             }
         }
         if CommandLine.arguments.contains("--cleanup-dry-run") {
@@ -315,6 +367,8 @@ final class AppModel: ObservableObject {
             wifiPassword = password
         }
         guard let pw = wifiPassword else { loadWiFiPassword(); return }
+        // A copy has the camera on its own hotspot; it puts the camera back when it's done.
+        guard !camera.holdWiFi else { camera.note("Saved \(name); the camera joins it after the copy"); return }
         Task { await camera.joinWiFi(ssid: name, password: pw) }
     }
 
@@ -496,7 +550,19 @@ final class AppModel: ObservableObject {
         guard !camera.isRecording else { return usbFallback("The camera is still recording.") }
 
         camera.holdWiFi = true
-        defer { camera.holdWiFi = false }
+        copyingTake = take.id
+        copyProgress = ""
+        // Keep the Mac awake (and the app out of App Nap) for the whole copy; a large clip
+        // takes minutes, longer with retries.
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled, .suddenTerminationDisabled],
+            reason: "Copying a clip from the Osmo Pocket")
+        defer {
+            camera.holdWiFi = false
+            copyingTake = nil
+            copyProgress = ""
+            ProcessInfo.processInfo.endActivity(activity)
+        }
         status("Finding the clip on the camera")
         if !camera.wifiLinkOpen { await camera.findOnNetwork(within: 15) }
         var listed = await camera.listClips()
@@ -523,13 +589,25 @@ final class AppModel: ObservableObject {
         var sources: [Take.CameraFile] = []
         var problem: String?
         if await camera.switchToHotspot() {
-            var joined = false
-            for attempt in 1...4 where !joined {
-                if let msg = await MacWiFi.join(login.ssid, password: login.password) {
-                    camera.note("Mac join try \(attempt): \(msg)")
+            func onHotspot() -> Bool { MacWiFi.wifiAddress?.hasPrefix("192.168.2.") == true }
+            func joinHotspot(tries: Int) async -> Bool {
+                for attempt in 1...tries {
+                    if let msg = await MacWiFi.join(login.ssid, password: login.password) {
+                        camera.note("Mac join try \(attempt): \(msg)")
+                    }
+                    if await MacWiFi.waitForWiFi({ $0.hasPrefix("192.168.2.") }, within: 12) { return true }
                 }
-                joined = await MacWiFi.waitForWiFi({ $0.hasPrefix("192.168.2.") }, within: 12)
+                return false
             }
+            // The Pocket shuts its hotspot down about a minute in unless an app holds its
+            // command link open on it, so open the link on the hotspot and keep it for the copy.
+            func holdHotspotLink() async {
+                camera.disconnectWiFi()
+                let ok = await camera.findOnNetwork(within: 8)
+                camera.note("Command link on the camera hotspot: \(ok ? "open" : "not answering")")
+            }
+            let joined = await joinHotspot(tries: 4)
+            if joined { await holdHotspotLink() }
             if joined {
                 camera.note("Mac on the camera hotspot")
                 let fm = FileManager.default
@@ -547,12 +625,54 @@ final class AppModel: ObservableObject {
                     }
                     let mb = Double(size) / 1_048_576
                     let started = Date()
+                    let partLabel = clips.count > 1 ? "part \(i + 1) of \(clips.count): " : ""
+                    var rejoinFailed = false
                     do {
-                        try await CameraDownload.fetch(clip.path, storage: storage, size: size, to: target) { done in
+                        try await CameraDownload.fetch(clip.path, storage: storage, size: size, to: target, progress: { done in
                             Task { @MainActor in
-                                self.hotspotStatus = "\(busy) \(Int(Double(done) * 100 / Double(size)))% of \(Int(mb)) MB"
+                                let pct = Int(Double(done) * 100 / Double(max(size, 1)))
+                                self.copyProgress = "Copying \(partLabel)\(pct)% of \(Int(mb)) MB"
+                                if let at = self.dropWiFiAt, pct >= at {
+                                    self.dropWiFiAt = nil
+                                    self.camera.note("BIG COPY TEST: turning the Mac's Wi-Fi off for 5 s at \(pct)%")
+                                    Task.detached {
+                                        MacWiFi.run(["-setairportpower", MacWiFi.device, "off"])
+                                        try? await Task.sleep(for: .seconds(5))
+                                        MacWiFi.run(["-setairportpower", MacWiFi.device, "on"])
+                                    }
+                                }
+                                self.hotspotStatus = "\(busy) \(pct)% of \(Int(mb)) MB"
                             }
-                        }
+                        }, shouldStop: {
+                            await MainActor.run { self.screenStudioRecording || self.camera.isRecording }
+                        }, recover: { h in
+                            await MainActor.run {
+                                self.camera.note(String(format: "Copy hiccup at %.0f MB (try %d): %@",
+                                                        Double(h.offset) / 1_048_576, h.attempt, h.error.localizedDescription))
+                            }
+                            // Never keep the camera off your Wi-Fi once a take starts.
+                            if await MainActor.run(body: { self.screenStudioRecording || self.camera.isRecording }) { return false }
+                            let pct = Int(Double(h.offset) * 100 / Double(max(size, 1)))
+                            let retrying = "Retrying (attempt \(h.attempt) of \(CopyRetry().maxAttempts))… \(pct)% copied"
+                            await MainActor.run { self.copyProgress = retrying; self.hotspotStatus = "\(busy) \(retrying)" }
+                            switch CopyRetry().step(attempt: h.attempt, macOnHotspot: onHotspot(), rejoinFailedBefore: rejoinFailed) {
+                            case .retry:
+                                break
+                            case .rejoinMac:
+                                camera.note("Mac left the camera hotspot; joining it again")
+                                rejoinFailed = !(await joinHotspot(tries: 2))
+                            case .restartHotspot:
+                                camera.note("Asking the camera to restart its hotspot")
+                                if await camera.restartHotspot() {
+                                    rejoinFailed = !(await joinHotspot(tries: 3))
+                                } else {
+                                    rejoinFailed = true
+                                }
+                            }
+                            if onHotspot() { await holdHotspotLink() }
+                            camera.note(onHotspot() ? "Mac on the camera hotspot; resuming" : "Mac still off the camera hotspot")
+                            return true
+                        })
                         let secs = max(Date().timeIntervalSince(started), 0.1)
                         camera.note(String(format: "Copied %@ (%.0f MB in %.0fs, %.0f MB/s)", target.lastPathComponent, mb, secs, mb / secs))
                         copied.append(target.path)
@@ -560,6 +680,9 @@ final class AppModel: ObservableObject {
                             sources.append(Take.CameraFile(local: target.path, path: clip.path, storage: storage, size: size,
                                                            listedSize: clip.size, handle: clip.handle))
                         }
+                    } catch is CancellationError {
+                        problem = "A recording started; the rest copies next time"
+                        break
                     } catch {
                         problem = error.localizedDescription
                         break
@@ -573,6 +696,7 @@ final class AppModel: ObservableObject {
         }
 
         // Put everything back, whatever happened above.
+        camera.disconnectWiFi()
         status("Rejoining \(home.ssid)")
         if let msg = await MacWiFi.join(home.ssid, password: home.password) { camera.note("Mac rejoin: \(msg)") }
         let back = await MacWiFi.waitForWiFi({ !$0.hasPrefix("192.168.2.") && !$0.hasPrefix("169.254.") }, within: 30)

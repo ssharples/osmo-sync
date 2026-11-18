@@ -119,11 +119,12 @@ public enum DUMLDatalink {
 public enum DUMLStation {
     public enum Role: Equatable { case station, accessPoint, unknown }
 
-    /// Reply to `wifiWorkMode`: `00 01` = on your Wi-Fi, `00 00` = its own hotspot.
+    /// Reply to `wifiWorkMode`: `00 01` = on your Wi-Fi, `00 00` (or `00 08` on a Pocket 4P)
+    /// = its own hotspot. `00 FF` shows up once the hotspot has shut down: radio off.
     public static func role(_ reply: [UInt8]) -> Role {
         switch reply {
         case [0, 1]: .station
-        case [0, 0]: .accessPoint
+        case [0, 0], [0, 8]: .accessPoint
         default: .unknown
         }
     }
