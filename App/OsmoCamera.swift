@@ -81,6 +81,9 @@ final class OsmoCamera: NSObject, ObservableObject {
     private var keepaliveTimer: Timer?
     /// Pockets don't send a status feed over Bluetooth, so track recording from our own commands.
     @Published private(set) var dumlRecording = false
+    /// When the camera last stopped recording, and last reported its heat flag.
+    private(set) var lastRecordingEnded: Date?
+    private(set) var lastHot: Date?
     private var bleWaiters: [(set: UInt8, id: UInt8, c: CheckedContinuation<DUML.Frame?, Never>)] = []
 
     // Wi-Fi link (Osmo Pocket on your home network)
@@ -661,6 +664,7 @@ final class OsmoCamera: NSObject, ObservableObject {
         if !ok, let code { note(String(format: "Camera refused record command (code %02X)", code)) }
         if ok {
             dumlRecording = start
+            if !start { lastRecordingEnded = Date() }
             onRecordingChanged?(start)
         }
         note(ok ? (start ? "Camera is recording" : "Camera stopped") : reply == nil ? "Camera did not confirm" : "Camera refused")
@@ -995,6 +999,7 @@ final class OsmoCamera: NSObject, ObservableObject {
                     if st.hot != (self.wifiCamStatus?.hot ?? false) {
                         self.note(String(format: "Camera heat flag %@ (status flags %08X)", st.hot ? "ON" : "off", st.flags))
                     }
+                    if st.hot { self.lastHot = Date() }
                     self.wifiCamStatus = st
                     self.wifiCamStatusAt = Date()
                 }
@@ -1308,5 +1313,36 @@ extension OsmoCamera: CBPeripheralDelegate {
                 if let f = RSDK.parse(raw) { handle(f) } else if trace { note("RX frame failed to parse") }
             }
         }
+    }
+}
+
+import CoreMediaIO
+
+/// Whether an app (Screen Studio, FaceTime…) is streaming the Pocket as a USB webcam.
+enum WebcamUse {
+    private static func address(_ selector: Int) -> CMIOObjectPropertyAddress {
+        CMIOObjectPropertyAddress(mSelector: CMIOObjectPropertySelector(selector),
+                                  mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+                                  mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
+    }
+
+    static func osmoInUse() -> Bool {
+        var a = address(kCMIOHardwarePropertyDevices)
+        var size: UInt32 = 0
+        let system = CMIOObjectID(kCMIOObjectSystemObject)
+        guard CMIOObjectGetPropertyDataSize(system, &a, 0, nil, &size) == noErr, size > 0 else { return false }
+        var ids = [CMIOObjectID](repeating: 0, count: Int(size) / MemoryLayout<CMIOObjectID>.size)
+        var used: UInt32 = 0
+        guard CMIOObjectGetPropertyData(system, &a, 0, nil, size, &used, &ids) == noErr else { return false }
+        for id in ids {
+            var na = address(kCMIOObjectPropertyName)
+            var name: Unmanaged<CFString>?
+            guard CMIOObjectGetPropertyData(id, &na, 0, nil, UInt32(MemoryLayout<Unmanaged<CFString>?>.size), &used, &name) == noErr,
+                  let n = name?.takeRetainedValue() as String?, n.localizedCaseInsensitiveContains("osmo") else { continue }
+            var ra = address(kCMIODevicePropertyDeviceIsRunningSomewhere)
+            var running: UInt32 = 0
+            if CMIOObjectGetPropertyData(id, &ra, 0, nil, 4, &used, &running) == noErr, running != 0 { return true }
+        }
+        return false
     }
 }

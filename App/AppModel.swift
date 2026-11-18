@@ -538,12 +538,43 @@ final class AppModel: ObservableObject {
             if cameraCardMounted {
                 importPending()
             } else {
-                await copyOverHotspot(take)
+                await copyWhenCool(take)
             }
         }
     }
 
     // MARK: Copy over the camera's hotspot
+
+    /// Takes waiting for the camera to cool before their automatic copy.
+    private var coolQueue: [UUID] = []
+
+    /// Automatic copies wait until the camera has rested five minutes after recording, isn't
+    /// flagged hot, and isn't streaming as a webcam (up to an hour). Copying over the hotspot
+    /// straight after a take, with the webcam live, is what made the Pocket overheat.
+    /// "Copy over Wi-Fi" in the menu still copies at once.
+    func copyWhenCool(_ take: Take) async {
+        guard !coolQueue.contains(take.id) else { return }
+        coolQueue.append(take.id)
+        guard coolQueue.count == 1 else { return }   // the running wait copies this one too
+        let gate = CopyGate()
+        let since = Date()
+        var said = ""
+        while !coolQueue.isEmpty {
+            let verdict = gate.check(now: Date(), waitingSince: since,
+                                     recording: screenStudioRecording || camera.isRecording,
+                                     lastRecordingEnded: camera.lastRecordingEnded,
+                                     webcamInUse: WebcamUse.osmoInUse(), lastHot: camera.lastHot)
+            if case .wait(let why) = verdict {
+                if why != said { camera.note("Copy waiting: \(why)"); said = why }
+                try? await Task.sleep(for: .seconds(15))
+                continue
+            }
+            let id = coolQueue.removeFirst()
+            guard let t = takes.first(where: { $0.id == id }), t.needsImport else { continue }
+            camera.note("Camera rested; copying \(t.name)")
+            await copyOverHotspot(t)
+        }
+    }
 
     /// Copies the newest take waiting for import, over the camera's hotspot.
     func copyLatestOverHotspot() {
