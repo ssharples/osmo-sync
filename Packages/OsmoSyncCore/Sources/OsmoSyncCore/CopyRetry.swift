@@ -61,3 +61,34 @@ public enum CopyRange {
         return p
     }
 }
+
+/// Getting the Mac onto the camera's hotspot at the start of a copy.
+///
+/// Now and then the camera answers "hotspot" but stays on your network (its role still reads
+/// station), so the Mac finds no hotspot to join. Asking again by cycling station → hotspot
+/// brings it up.
+public struct HotspotReach: Equatable {
+    public enum Step: Equatable {
+        /// Ask the camera for its hotspot.
+        case switchToHotspot
+        /// Cycle the camera through station mode and back to hotspot, after a wait.
+        case restartHotspot(wait: TimeInterval)
+        /// Give up: the copy fails and waits for the next try.
+        case giveUp
+    }
+
+    public let attempts: Int
+    public init(attempts: Int = 3) { self.attempts = attempts }
+
+    public func step(attempt: Int, policy: CopyRetry = CopyRetry()) -> Step {
+        if attempt <= 1 { return .switchToHotspot }
+        guard attempt <= attempts else { return .giveUp }
+        return .restartHotspot(wait: policy.delay(attempt: attempt - 1))
+    }
+
+    /// Only try the Mac's join when the camera confirmed its hotspot, or on the last try.
+    /// Joining a hotspot that isn't there costs over a minute.
+    public func shouldJoin(confirmed: Bool, attempt: Int) -> Bool {
+        confirmed || attempt >= attempts
+    }
+}

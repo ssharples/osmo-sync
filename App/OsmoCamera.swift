@@ -812,7 +812,14 @@ final class OsmoCamera: NSObject, ObservableObject {
     }
 
     /// Takes the camera off your Wi-Fi and back onto its own hotspot, where it serves files.
+    /// Whether the last `switchToHotspot` saw the camera report its hotspot role.
+    private(set) var hotspotConfirmed = false
+
+    /// Test hook: the next hotspot switch reports no hotspot, as the camera sometimes does.
+    var failNextHotspotSwitch = false
+
     func switchToHotspot() async -> Bool {
+        hotspotConfirmed = false
         guard useDUML, state.isReady else { return false }
         disconnectWiFi()
         let r = await bleRequest(DUML.stationMode(false, seq: nextDUMLSeq()), timeout: 12)?.payload
@@ -821,7 +828,12 @@ final class OsmoCamera: NSObject, ObservableObject {
             await pause(1)
             let role = await bleRequest(DUML.wifiRole(seq: nextDUMLSeq()), timeout: 6)?.payload ?? []
             // `00 FF` means the radio is off (a hotspot that shut down), not a hotspot.
-            if DUMLStation.role(role) == .accessPoint { note("Camera is on its own hotspot (\(Self.hex(role)))"); return true }
+            if failNextHotspotSwitch { failNextHotspotSwitch = false; note("TEST: ignoring the hotspot role"); break }
+            if DUMLStation.role(role) == .accessPoint {
+                note("Camera is on its own hotspot (\(Self.hex(role)))")
+                hotspotConfirmed = true
+                return true
+            }
             if !role.isEmpty { note("Camera Wi-Fi role while switching: \(Self.hex(role))") }
         }
         // The readback isn't always clear; the Mac's join decides.

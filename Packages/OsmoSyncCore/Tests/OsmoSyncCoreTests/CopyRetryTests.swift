@@ -66,3 +66,20 @@ final class HotspotRoleTests: XCTestCase {
         XCTAssertEqual(DUMLStation.role([]), .unknown)
     }
 }
+
+final class HotspotReachTests: XCTestCase {
+    func testAsksThenRestartsWithBackoffThenGivesUp() {
+        let r = HotspotReach()
+        XCTAssertEqual(r.step(attempt: 1), .switchToHotspot)
+        XCTAssertEqual(r.step(attempt: 2), .restartHotspot(wait: 2))
+        XCTAssertEqual(r.step(attempt: 3), .restartHotspot(wait: 4))
+        XCTAssertEqual(r.step(attempt: 4), .giveUp)
+    }
+
+    func testSkipsTheMacJoinUntilTheHotspotIsConfirmed() {
+        let r = HotspotReach()
+        XCTAssertFalse(r.shouldJoin(confirmed: false, attempt: 1))
+        XCTAssertTrue(r.shouldJoin(confirmed: true, attempt: 1))
+        XCTAssertTrue(r.shouldJoin(confirmed: false, attempt: 3))
+    }
+}

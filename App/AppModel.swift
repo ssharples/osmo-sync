@@ -321,6 +321,7 @@ final class AppModel: ObservableObject {
                 for _ in 0..<180 where !(camera.state.isReady && camera.wifiLinkOpen) { try? await Task.sleep(for: .seconds(0.5)) }
                 camera.note("COPY TEST: camera ready \(camera.state.isReady), Wi-Fi link \(camera.wifiLinkOpen)")
                 guard let take = takes.first(where: \.needsImport) else { camera.note("COPY TEST: nothing waiting"); return }
+                if CommandLine.arguments.contains("--fail-hotspot") { camera.failNextHotspotSwitch = true }
                 await copyOverHotspot(take)
                 camera.note("COPY TEST: done")
             }
@@ -681,7 +682,7 @@ final class AppModel: ObservableObject {
         var copied: [String] = []
         var sources: [Take.CameraFile] = []
         var problem: String?
-        if await camera.switchToHotspot() {
+        do {
             func onHotspot() -> Bool { MacWiFi.wifiAddress?.hasPrefix("192.168.2.") == true }
             func joinHotspot(tries: Int) async -> Bool {
                 for attempt in 1...tries {
@@ -699,7 +700,33 @@ final class AppModel: ObservableObject {
                 let ok = await camera.findOnNetwork(within: 8)
                 camera.note("Command link on the camera hotspot: \(ok ? "open" : "not answering")")
             }
-            let joined = await joinHotspot(tries: 4)
+            // Get the camera's hotspot up and the Mac on it. The camera sometimes answers
+            // "hotspot" but stays on your network; ask again, with backoff, before failing.
+            func reachHotspot() async -> Bool {
+                let reach = HotspotReach()
+                for attempt in 1...reach.attempts {
+                    switch reach.step(attempt: attempt) {
+                    case .switchToHotspot:
+                        _ = await camera.switchToHotspot()
+                    case .restartHotspot(let wait):
+                        if screenStudioRecording || camera.isRecording { return false }
+                        status("Camera hotspot didn't come up; asking again (try \(attempt) of \(reach.attempts))")
+                        try? await Task.sleep(for: .seconds(wait))
+                        if screenStudioRecording || camera.isRecording { return false }
+                        _ = await camera.restartHotspot()
+                    case .giveUp:
+                        return false
+                    }
+                    guard reach.shouldJoin(confirmed: camera.hotspotConfirmed, attempt: attempt) else {
+                        camera.note("Camera didn't confirm its hotspot (try \(attempt))")
+                        continue
+                    }
+                    if await joinHotspot(tries: camera.hotspotConfirmed ? 4 : 2) { return true }
+                    camera.note("Mac couldn't find the camera hotspot (try \(attempt))")
+                }
+                return false
+            }
+            let joined = await reachHotspot()
             if joined { await holdHotspotLink() }
             if joined {
                 camera.note("Mac on the camera hotspot")
@@ -782,10 +809,8 @@ final class AppModel: ObservableObject {
                     }
                 }
             } else {
-                problem = "The Mac couldn't join the camera's hotspot"
+                problem = "The camera's hotspot didn't come up after 3 tries"
             }
-        } else {
-            problem = "The camera didn't switch to its hotspot"
         }
 
         // Put everything back, whatever happened above.
