@@ -34,4 +34,24 @@ public enum CameraMedia {
             .sorted { $0.modified < $1.modified }
             .map(\.url)
     }
+
+    public struct CopyMismatch: LocalizedError {
+        public let expected: Int64, got: Int64
+        public var errorDescription: String? { "the copy is \(got) bytes, the clip is \(expected)" }
+    }
+
+    /// Copies a clip and checks the copy is the same size, deleting a short or failed copy so
+    /// no half-written file is left behind.
+    public static func copyChecked(_ src: URL, to dst: URL) throws {
+        let fm = FileManager.default
+        do {
+            try fm.copyItem(at: src, to: dst)
+            let a = (try fm.attributesOfItem(atPath: src.path)[.size] as? NSNumber)?.int64Value ?? -1
+            let b = (try fm.attributesOfItem(atPath: dst.path)[.size] as? NSNumber)?.int64Value ?? -2
+            guard a == b else { throw CopyMismatch(expected: a, got: b) }
+        } catch {
+            try? fm.removeItem(at: dst)
+            throw error
+        }
+    }
 }

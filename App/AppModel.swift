@@ -535,6 +535,11 @@ final class AppModel: ObservableObject {
         // Say so at once if the camera can't be reached, rather than after the take.
         let reachable = camera.state.isReady && camera.wifiReady
         if !reachable { notify(Self.unreachableTitle, Self.unreachableBody) }
+        if cameraCardMounted {
+            camera.note("The Pocket is in File transfer mode, so it can't record")
+            notify("Osmo can't record in File transfer mode",
+                   "Switch the Pocket back to Charge only to record.")
+        }
         if WebcamUse.osmoInUse() {
             // The camera's own recording follows the webcam format while it streams.
             camera.note("The Osmo is streaming as a webcam, so this take records at webcam quality")
@@ -578,56 +583,17 @@ final class AppModel: ObservableObject {
             guard started || camera.isRecording || take.cameraStarted else { return }
             let stopped = await camera.stopRecording()
             guard autoImport, stopped else { return }
+            // Clips copy over USB only. The camera can't record in File transfer mode,
+            // so it is normally on Charge only here and the clip waits on the camera.
             if cameraCardMounted {
                 importPending()
             } else {
-                await copyWhenCool(take)
+                camera.note("\(take.name): clip stays on the camera until you plug it in and pick File transfer")
             }
         }
     }
 
     // MARK: Copy over the camera's hotspot
-
-    /// Takes queued for their automatic copy.
-    @Published private(set) var coolQueue: [UUID] = []
-    /// Why the queued copies are waiting, and when the heat wait ends (nil if heat isn't
-    /// what holds them back).
-    @Published private(set) var copyWaitReason = ""
-    @Published private(set) var copyStartsAt: Date?
-
-    /// Automatic copies start as soon as the take stops. They wait only while the camera
-    /// records, or for five minutes after it reports it's hot.
-    func copyWhenCool(_ take: Take) async {
-        guard !coolQueue.contains(take.id) else { return }
-        coolQueue.append(take.id)
-        guard coolQueue.count == 1 else { return }   // the running wait copies this one too
-        let gate = CopyGate()
-        var said = ""
-        while !coolQueue.isEmpty {
-            let verdict = gate.check(now: Date(), recording: screenStudioRecording || camera.isRecording,
-                                     lastHot: camera.lastHot)
-            if case .wait(let why) = verdict {
-                if why != said { camera.note("Copy waiting: \(why)"); said = why }
-                copyWaitReason = why
-                copyStartsAt = gate.coolsAt(lastHot: camera.lastHot)
-                    .flatMap { $0 > Date() ? $0 : nil }
-                try? await Task.sleep(for: .seconds(5))
-                continue
-            }
-            copyWaitReason = ""
-            copyStartsAt = nil
-            let id = coolQueue.removeFirst()
-            guard let t = takes.first(where: { $0.id == id }), t.needsImport else { continue }
-            camera.note("Copying \(t.name)")
-            await copyOverHotspot(t)
-        }
-    }
-
-    /// Copies the newest take waiting for import, over the camera's hotspot.
-    func copyLatestOverHotspot() {
-        guard let take = takes.first(where: \.needsImport) else { camera.note("Nothing waiting to copy"); return }
-        Task { await copyOverHotspot(take) }
-    }
 
     /// The camera serves files only on its own hotspot. So: list the take's clips over your
     /// Wi-Fi, switch the camera to its hotspot, move the Mac's Wi-Fi onto it, download, then
@@ -1166,7 +1132,10 @@ final class AppModel: ObservableObject {
                     t.importNote = note ?? "Copied \(copied.count) clip\(copied.count == 1 ? "" : "s")"
                     self.updateTake(t)
                     self.camera.note("\(take.name): \(t.importNote ?? "")")
-                    if !copied.isEmpty { self.notify("Osmo clip imported", "\(take.name) → \(dest.lastPathComponent)") }
+                    if !copied.isEmpty {
+                        self.notify("Copied \(copied.count) clip\(copied.count == 1 ? "" : "s") over USB",
+                                    "\(take.name) → \(dest.lastPathComponent). Switch the Pocket back to Charge only to record.")
+                    }
                 }
                 self.importing = false
                 let checked = finished.filter { !$0.1.isEmpty }.map(\.0.id)
@@ -1193,7 +1162,7 @@ final class AppModel: ObservableObject {
                 target = dest.appendingPathComponent("\(name) - Osmo\(suffix) (\(n)).\(clip.pathExtension)")
                 n += 1
             }
-            try fm.copyItem(at: clip, to: target)
+            try CameraMedia.copyChecked(clip, to: target)
             out.append(target.path)
         }
         return out
