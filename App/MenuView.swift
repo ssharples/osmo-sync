@@ -62,6 +62,10 @@ struct MenuView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
             }
+            if WebcamUse.osmoInUse() {
+                Text("Screen Studio is using the Osmo as a webcam, so it records at webcam quality, not 4K 60. Turn the camera off in Screen Studio.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             HStack {
                 switch camera.state {
                 case .ready:
@@ -198,6 +202,9 @@ struct MenuView: View {
                     }
                     if let d = t.deleteNote {
                         Text(d).font(.caption2).foregroundStyle(t.removedFromCamera == true ? .green : .secondary)
+                    }
+                    if let q = t.qualityNote {
+                        Text(q).font(.caption2).foregroundStyle(.orange)
                     }
                     if let s = t.syncNote {
                         Text(s).font(.caption2).foregroundStyle(s.hasPrefix("Synced") ? .green : .secondary)

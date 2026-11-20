@@ -48,6 +48,8 @@ struct Take: Codable, Identifiable, Equatable {
     var removedFromCamera: Bool?
     /// Why a clip stayed on the camera, when it did.
     var deleteNote: String?
+    /// Set when the clip came out below 4K 60 (usually because of the webcam stream).
+    var qualityNote: String?
 
     struct CameraFile: Codable, Equatable {
         /// The copy in Osmo Takes.
@@ -498,6 +500,12 @@ final class AppModel: ObservableObject {
         // Say so at once if the camera can't be reached, rather than after the take.
         let reachable = camera.state.isReady && camera.wifiReady
         if !reachable { notify(Self.unreachableTitle, Self.unreachableBody) }
+        if WebcamUse.osmoInUse() {
+            // The camera's own recording follows the webcam format while it streams.
+            camera.note("The Osmo is streaming as a webcam, so this take records at webcam quality")
+            notify("Osmo will record at webcam quality",
+                   "Screen Studio is using the Osmo as its webcam. Turn the camera off in Screen Studio to record in 4K 60.")
+        }
         startTask = Task {
             let ok = await camera.startRecording()
             take.cameraStarted = ok
@@ -780,6 +788,7 @@ final class AppModel: ObservableObject {
                 updateTake(k)
             }
         }
+        if !copied.isEmpty { await checkQuality(take.id) }
         if !copied.isEmpty, autoLineUp, let fresh = takes.first(where: { $0.id == take.id }) { await lineUp(fresh) }
         if !online { notify("Check your internet", "OsmoSync put the Mac back on \(home.ssid) but couldn't reach the internet.") }
     }
@@ -962,6 +971,30 @@ final class AppModel: ObservableObject {
     // MARK: Line up with Screen Studio
 
     /// Writes "<take> - Osmo (synced).mov", which starts at the same moment as the screen recording.
+    /// Reads each copied clip's size and frame rate, and says so on the take when it came
+    /// out below 4K 60.
+    func checkQuality(_ id: UUID) async {
+        guard var t = takes.first(where: { $0.id == id }) else { return }
+        var notes: [String] = []
+        for f in t.imported {
+            guard let q = await Self.clipQuality(URL(fileURLWithPath: f)) else { continue }
+            camera.note("\(URL(fileURLWithPath: f).lastPathComponent): \(q.summary)")
+            if let n = q.shortfall() { notes.append(n) }
+        }
+        t.qualityNote = notes.first
+        updateTake(t)
+        if let n = notes.first { notify("Osmo clip below 4K 60", n) }
+    }
+
+    nonisolated static func clipQuality(_ url: URL) async -> ClipQuality? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let (size, transform, fps) = try? await track.load(.naturalSize, .preferredTransform, .nominalFrameRate)
+        else { return nil }
+        let r = CGRect(origin: .zero, size: size).applying(transform)
+        return ClipQuality(width: Int(abs(r.width).rounded()), height: Int(abs(r.height).rounded()), fps: Double(fps))
+    }
+
     func lineUp(_ take: Take) async {
         guard let clip = take.imported.first.map(URL.init(fileURLWithPath:)) else { return }
         let project = projectsFolder.appendingPathComponent("\(take.name).screenstudio")
@@ -1073,6 +1106,8 @@ final class AppModel: ObservableObject {
                     if !copied.isEmpty { self.notify("Osmo clip imported", "\(take.name) → \(dest.lastPathComponent)") }
                 }
                 self.importing = false
+                let checked = finished.filter { !$0.1.isEmpty }.map(\.0.id)
+                Task { @MainActor in for id in checked { await self.checkQuality(id) } }
                 if self.autoLineUp {
                     let ids = Set(finished.filter { !$0.1.isEmpty }.map(\.0.id))
                     Task { @MainActor in

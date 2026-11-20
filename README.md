@@ -26,7 +26,7 @@ Needs Xcode 16 or later and `xcodegen` (`brew install xcodegen`).
 
 ## Limits
 
-- The camera records to its own card. If the Pocket is plugged in as a **webcam**, it is in webcam (UVC) mode and can't record to the card at the same time. Use USB for power only, or no cable, while recording. Feed Screen Studio from another camera if you need a webcam view.
+- The camera records to its own storage. While an app (such as Screen Studio) streams the Pocket as a **webcam**, the camera still records, but at the webcam's format (for example 1080p at 30 fps), not its own video setting. For 4K 60, turn the Osmo camera off in Screen Studio and use USB for power only. OsmoSync warns when a take starts with the webcam in use, and marks clips that came out below 4K 60.
 - Recording control over the R-SDK is documented by DJI for the Osmo Action 4/5 Pro/6 and Osmo 360. The pairing has been shown to work on the Pocket 3 and 4 by other open-source apps; recording control on the Pocket still needs checking on a real camera.
 - Clips are matched by time, so the camera's clock should be right (DJI Mimo sets it). With one take waiting, OsmoSync falls back to the newest clip.
 - Copying over Wi-Fi (no cable) is not built yet.
