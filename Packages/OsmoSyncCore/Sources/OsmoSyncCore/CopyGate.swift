@@ -2,19 +2,15 @@ import Foundation
 
 /// When an automatic Wi-Fi copy may start.
 ///
-/// A copy runs the camera's own hotspot flat out for a minute or more. Straight after a
-/// recording, or while an app streams the camera as a webcam, that extra load is what tips
-/// the Pocket into its overheating warning. So automatic copies wait for the camera to cool.
+/// Copies start as soon as a take stops. They hold back only while the camera records, and
+/// for a few minutes after the camera reports it's hot, since running the hotspot flat out
+/// then can tip it into its overheating warning.
 public struct CopyGate {
-    /// Rest after a recording ends before copying.
-    public let coolDown: TimeInterval
-    /// Longest wait for the webcam stream to stop; after this the copy goes ahead anyway,
-    /// so a camera preview left open all day doesn't stall copies for good.
-    public let maxWebcamWait: TimeInterval
+    /// How long to wait after the camera's heat flag was last seen on.
+    public let heatWait: TimeInterval
 
-    public init(coolDown: TimeInterval = 300, maxWebcamWait: TimeInterval = 3600) {
-        self.coolDown = coolDown
-        self.maxWebcamWait = maxWebcamWait
+    public init(heatWait: TimeInterval = 300) {
+        self.heatWait = heatWait
     }
 
     public enum Verdict: Equatable {
@@ -22,20 +18,16 @@ public struct CopyGate {
         case wait(String)
     }
 
-    /// - Parameters:
-    ///   - waitingSince: when this copy was first held back.
-    ///   - lastHot: the last time the camera's heat flag was seen on.
-    public func check(now: Date, waitingSince: Date, recording: Bool, lastRecordingEnded: Date?,
-                      webcamInUse: Bool, lastHot: Date?) -> Verdict {
+    /// When the heat wait ends, or nil if the camera hasn't reported heat.
+    public func coolsAt(lastHot: Date?) -> Date? {
+        lastHot?.addingTimeInterval(heatWait)
+    }
+
+    /// - Parameter lastHot: the last time the camera's heat flag was seen on.
+    public func check(now: Date, recording: Bool, lastHot: Date?) -> Verdict {
         if recording { return .wait("the camera is recording") }
-        if let hot = lastHot, now.timeIntervalSince(hot) < coolDown {
+        if let hot = lastHot, now.timeIntervalSince(hot) < heatWait {
             return .wait("the camera reported it's hot")
-        }
-        if let ended = lastRecordingEnded, now.timeIntervalSince(ended) < coolDown {
-            return .wait("the camera is cooling after recording")
-        }
-        if webcamInUse, now.timeIntervalSince(waitingSince) < maxWebcamWait {
-            return .wait("an app is using the camera as a webcam")
         }
         return .go
     }

@@ -588,33 +588,37 @@ final class AppModel: ObservableObject {
 
     // MARK: Copy over the camera's hotspot
 
-    /// Takes waiting for the camera to cool before their automatic copy.
-    private var coolQueue: [UUID] = []
+    /// Takes queued for their automatic copy.
+    @Published private(set) var coolQueue: [UUID] = []
+    /// Why the queued copies are waiting, and when the heat wait ends (nil if heat isn't
+    /// what holds them back).
+    @Published private(set) var copyWaitReason = ""
+    @Published private(set) var copyStartsAt: Date?
 
-    /// Automatic copies wait until the camera has rested five minutes after recording, isn't
-    /// flagged hot, and isn't streaming as a webcam (up to an hour). Copying over the hotspot
-    /// straight after a take, with the webcam live, is what made the Pocket overheat.
-    /// "Copy over Wi-Fi" in the menu still copies at once.
+    /// Automatic copies start as soon as the take stops. They wait only while the camera
+    /// records, or for five minutes after it reports it's hot.
     func copyWhenCool(_ take: Take) async {
         guard !coolQueue.contains(take.id) else { return }
         coolQueue.append(take.id)
         guard coolQueue.count == 1 else { return }   // the running wait copies this one too
         let gate = CopyGate()
-        let since = Date()
         var said = ""
         while !coolQueue.isEmpty {
-            let verdict = gate.check(now: Date(), waitingSince: since,
-                                     recording: screenStudioRecording || camera.isRecording,
-                                     lastRecordingEnded: camera.lastRecordingEnded,
-                                     webcamInUse: WebcamUse.osmoInUse(), lastHot: camera.lastHot)
+            let verdict = gate.check(now: Date(), recording: screenStudioRecording || camera.isRecording,
+                                     lastHot: camera.lastHot)
             if case .wait(let why) = verdict {
                 if why != said { camera.note("Copy waiting: \(why)"); said = why }
-                try? await Task.sleep(for: .seconds(15))
+                copyWaitReason = why
+                copyStartsAt = gate.coolsAt(lastHot: camera.lastHot)
+                    .flatMap { $0 > Date() ? $0 : nil }
+                try? await Task.sleep(for: .seconds(5))
                 continue
             }
+            copyWaitReason = ""
+            copyStartsAt = nil
             let id = coolQueue.removeFirst()
             guard let t = takes.first(where: { $0.id == id }), t.needsImport else { continue }
-            camera.note("Camera rested; copying \(t.name)")
+            camera.note("Copying \(t.name)")
             await copyOverHotspot(t)
         }
     }

@@ -196,6 +196,11 @@ struct MenuView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(t.name).font(.caption).lineLimit(1)
                     Text(takeLine(t)).font(.caption2).foregroundStyle(.secondary)
+                    if model.coolQueue.contains(t.id) {
+                        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            Text(copyWaitText(now: ctx.date)).font(.caption2).foregroundStyle(.blue)
+                        }
+                    }
                     if t.id == model.copyingTake, !model.copyProgress.isEmpty {
                         Text(model.copyProgress).font(.caption2)
                             .foregroundStyle(model.copyProgress.hasPrefix("Retrying") ? .orange : .blue)
@@ -212,6 +217,15 @@ struct MenuView: View {
                 }
             }
         }
+    }
+
+    /// "Waiting to copy: starts in 3:12 (camera hot)".
+    private func copyWaitText(now: Date) -> String {
+        if let at = model.copyStartsAt, at > now {
+            let left = Int(at.timeIntervalSince(now).rounded(.up))
+            return String(format: "Waiting to copy: starts in %d:%02d (camera hot)", left / 60, left % 60)
+        }
+        return model.copyWaitReason.isEmpty ? "Copying soon" : "Waiting to copy: \(model.copyWaitReason)"
     }
 
     private var logSection: some View {
