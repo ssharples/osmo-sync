@@ -204,6 +204,40 @@ final class AppModel: ObservableObject {
                 camera.note("DELETE TEST: done")
             }
         }
+        if CommandLine.arguments.contains("--quality-test") {
+            // Test hook: record about 8 seconds with no webcam stream, copy the clip the usual
+            // way (USB if the camera is mounted, else Wi-Fi), then log its size and frame rate.
+            Task { @MainActor in
+                for _ in 0..<60 where !camera.state.isReady { try? await Task.sleep(for: .seconds(0.5)) }
+                guard camera.state.isReady else { camera.note("QUALITY TEST: camera not connected"); return }
+                guard !screenStudioRecording, !camera.isRecording else { camera.note("QUALITY TEST: a recording is running; not testing"); return }
+                guard !WebcamUse.osmoInUse() else { camera.note("QUALITY TEST: the webcam is in use; not testing"); return }
+                camera.note("QUALITY TEST: card mounted \(cameraCardMounted)")
+                let start = Date()
+                guard await camera.startRecording() else { camera.note("QUALITY TEST: camera didn't start"); return }
+                let started = Date()
+                try? await Task.sleep(for: .seconds(8))
+                await camera.stopRecording()
+                var t = Take(name: "OsmoSync quality test \(start.formatted(.iso8601.time(includingFractionalSeconds: false)))",
+                             start: start, end: Date(), cameraStarted: true)
+                t.cameraStartedAt = started
+                addTake(t)
+                try? await Task.sleep(for: .seconds(3))
+                if cameraCardMounted {
+                    importPending()
+                    for _ in 0..<120 where takes.first(where: { $0.id == t.id })?.imported.isEmpty ?? true {
+                        try? await Task.sleep(for: .seconds(1))
+                    }
+                } else {
+                    await copyOverHotspot(t)
+                }
+                for f in takes.first(where: { $0.id == t.id })?.imported ?? [] {
+                    let q = await Self.clipQuality(URL(fileURLWithPath: f))
+                    camera.note("QUALITY TEST: \(URL(fileURLWithPath: f).lastPathComponent): \(q?.summary ?? "unreadable")")
+                }
+                camera.note("QUALITY TEST: done")
+            }
+        }
         if CommandLine.arguments.contains("--rest-test") {
             // Test hook: wait for the camera to rest, let one network check pass, then time how
             // long the Wi-Fi link takes to come back (what a recording start would wait for).
